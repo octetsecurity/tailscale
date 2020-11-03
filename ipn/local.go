@@ -543,7 +543,7 @@ func (b *LocalBackend) updateFilter(netMap *controlclient.NetworkMap, prefs *Pre
 		return
 	}
 
-	localNets := wgCIDRsToFilter(netMap.Addresses, advRoutes)
+	localNets := wgCIDRToNetaddr(netMap.Addresses, advRoutes)
 
 	if shieldsUp {
 		b.logf("netmap packet filter: (shields up)")
@@ -1268,31 +1268,16 @@ func routerConfig(cfg *wgcfg.Config, prefs *Prefs) *router.Config {
 	return rs
 }
 
-// wgCIDRsToFilter converts lists of wgcfg.CIDR into a single list of
-// filter.Net.
-func wgCIDRsToFilter(cidrLists ...[]wgcfg.CIDR) (ret []filter.Net) {
-	for _, cidrs := range cidrLists {
+func wgCIDRToNetaddr(cidrList ...[]wgcfg.CIDR) (ret []netaddr.IPPrefix) {
+	for _, cidrs := range cidrList {
 		for _, cidr := range cidrs {
-			if !cidr.IP.Is4() {
-				continue
+			ncidr, ok := netaddr.FromStdIPNet(cidr.IPNet())
+			if !ok {
+				panic(fmt.Sprintf("conversion of %s from wgcfg to netaddr IPNet failed", cidr))
 			}
-			ret = append(ret, filter.Net{
-				IP:   filter.NewIP(cidr.IP.IP()),
-				Mask: filter.Netmask(int(cidr.Mask)),
-			})
+			ncidr.IP = ncidr.IP.Unmap()
+			ret = append(ret, ncidr)
 		}
-	}
-	return ret
-}
-
-func wgCIDRToNetaddr(cidrs []wgcfg.CIDR) (ret []netaddr.IPPrefix) {
-	for _, cidr := range cidrs {
-		ncidr, ok := netaddr.FromStdIPNet(cidr.IPNet())
-		if !ok {
-			panic(fmt.Sprintf("conversion of %s from wgcfg to netaddr IPNet failed", cidr))
-		}
-		ncidr.IP = ncidr.IP.Unmap()
-		ret = append(ret, ncidr)
 	}
 	return ret
 }

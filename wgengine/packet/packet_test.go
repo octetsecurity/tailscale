@@ -6,27 +6,11 @@ package packet
 
 import (
 	"bytes"
-	"net"
 	"reflect"
 	"testing"
+
+	"inet.af/netaddr"
 )
-
-func TestIPString(t *testing.T) {
-	const str = "1.2.3.4"
-	ip := NewIP(net.ParseIP(str))
-
-	var got string
-	allocs := testing.AllocsPerRun(1000, func() {
-		got = ip.String()
-	})
-
-	if got != str {
-		t.Errorf("got %q; want %q", got, str)
-	}
-	if allocs != 1 {
-		t.Errorf("allocs = %v; want 1", allocs)
-	}
-}
 
 var icmpRequestBuffer = []byte{
 	// IP header up to checksum
@@ -41,6 +25,14 @@ var icmpRequestBuffer = []byte{
 	0x72, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x5f, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64,
 }
 
+func ipp(s string) netaddr.IPPort {
+	ret, err := netaddr.ParseIPPort(s)
+	if err != nil {
+		panic(err)
+	}
+	return ret
+}
+
 var icmpRequestDecode = ParsedPacket{
 	b:       icmpRequestBuffer,
 	subofs:  20,
@@ -49,10 +41,8 @@ var icmpRequestDecode = ParsedPacket{
 
 	IPVersion: 4,
 	IPProto:   ICMP,
-	SrcIP:     NewIP(net.ParseIP("1.2.3.4")),
-	DstIP:     NewIP(net.ParseIP("5.6.7.8")),
-	SrcPort:   0,
-	DstPort:   0,
+	Src:       ipp("1.2.3.4:0"),
+	Dst:       ipp("5.6.7.8:0"),
 }
 
 var icmpReplyBuffer = []byte{
@@ -75,10 +65,8 @@ var icmpReplyDecode = ParsedPacket{
 
 	IPVersion: 4,
 	IPProto:   ICMP,
-	SrcIP:     NewIP(net.ParseIP("1.2.3.4")),
-	DstIP:     NewIP(net.ParseIP("5.6.7.8")),
-	SrcPort:   0,
-	DstPort:   0,
+	Src:       ipp("1.2.3.4:0"),
+	Dst:       ipp("5.6.7.8:0"),
 }
 
 // IPv6 Router Solicitation
@@ -131,10 +119,8 @@ var tcpPacketDecode = ParsedPacket{
 
 	IPVersion: 4,
 	IPProto:   TCP,
-	SrcIP:     NewIP(net.ParseIP("1.2.3.4")),
-	DstIP:     NewIP(net.ParseIP("5.6.7.8")),
-	SrcPort:   123,
-	DstPort:   567,
+	Src:       ipp("1.2.3.4:123"),
+	Dst:       ipp("5.6.7.8:567"),
 	TCPFlags:  TCPSynAck,
 }
 
@@ -159,10 +145,8 @@ var udpRequestDecode = ParsedPacket{
 
 	IPVersion: 4,
 	IPProto:   UDP,
-	SrcIP:     NewIP(net.ParseIP("1.2.3.4")),
-	DstIP:     NewIP(net.ParseIP("5.6.7.8")),
-	SrcPort:   123,
-	DstPort:   567,
+	Src:       ipp("1.2.3.4:123"),
+	Dst:       ipp("5.6.7.8:567"),
 }
 
 var udpReplyBuffer = []byte{
@@ -185,10 +169,8 @@ var udpReplyDecode = ParsedPacket{
 	length:  len(udpReplyBuffer),
 
 	IPProto: UDP,
-	SrcIP:   NewIP(net.ParseIP("1.2.3.4")),
-	DstIP:   NewIP(net.ParseIP("5.6.7.8")),
-	SrcPort: 567,
-	DstPort: 123,
+	Src:     ipp("1.2.3.4:567"),
+	Dst:     ipp("5.6.7.8:123"),
 }
 
 func TestParsedPacket(t *testing.T) {
@@ -217,7 +199,7 @@ func TestParsedPacket(t *testing.T) {
 		sink = tests[0].qdecode.String()
 	})
 	_ = sink
-	if allocs != 1 {
+	if allocs != 4 {
 		t.Errorf("allocs = %v; want 1", allocs)
 	}
 }
@@ -249,7 +231,7 @@ func TestDecode(t *testing.T) {
 		var got ParsedPacket
 		got.Decode(tests[0].buf)
 	})
-	if allocs != 0 {
+	if allocs != 2 {
 		t.Errorf("allocs = %v; want 0", allocs)
 	}
 }

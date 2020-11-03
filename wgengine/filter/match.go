@@ -6,54 +6,16 @@ package filter
 
 import (
 	"fmt"
-	"math/bits"
-	"net"
 	"strings"
 
+	"inet.af/netaddr"
 	"tailscale.com/wgengine/packet"
 )
 
-func NewIP(ip net.IP) packet.IP {
-	return packet.NewIP(ip)
-}
-
-type Net struct {
-	IP   packet.IP
-	Mask packet.IP
-}
-
-func (n Net) Includes(ip packet.IP) bool {
-	return (n.IP & n.Mask) == (ip & n.Mask)
-}
-
-func (n Net) Bits() int {
-	return 32 - bits.TrailingZeros32(uint32(n.Mask))
-}
-
-func (n Net) String() string {
-	b := n.Bits()
-	if b == 32 {
-		return n.IP.String()
-	} else if b == 0 {
-		return "*"
-	} else {
-		return fmt.Sprintf("%s/%d", n.IP, b)
-	}
-}
-
-var NetAny = Net{0, 0}
-var NetNone = Net{^packet.IP(0), ^packet.IP(0)}
-
-func Netmask(bits int) packet.IP {
-	b := ^uint32((1 << (32 - bits)) - 1)
-	return packet.IP(b)
-}
-
+// PortRange is a range of TCP or UDP ports.
 type PortRange struct {
-	First, Last uint16
+	First, Last uint16 // the range is inclusive of First and Last.
 }
-
-var PortRangeAny = PortRange{0, 65535}
 
 func (pr PortRange) String() string {
 	if pr.First == 0 && pr.Last == 65535 {
@@ -65,29 +27,42 @@ func (pr PortRange) String() string {
 	}
 }
 
+// NetPortRange is a range of IPv4 addresses and TCP or UDP ports.
 type NetPortRange struct {
-	Net   Net
+	Net   netaddr.IPPrefix
 	Ports PortRange
 }
 
-var NetPortRangeAny = NetPortRange{NetAny, PortRangeAny}
-
-func (ipr NetPortRange) String() string {
-	return fmt.Sprintf("%v:%v", ipr.Net, ipr.Ports)
+func (npr NetPortRange) String() string {
+	return fmt.Sprintf("%v:%v", npr.Net, npr.Ports)
 }
 
+var (
+	// NetAny is an IPPrefix that matches all IPv4 addresses.
+	NetAny = netaddr.IPPrefix{
+		IP:   netaddr.IPv4(0, 0, 0, 0),
+		Bits: 0,
+	}
+	// NetNone is an IPPrefix that doesn't match any IPv4 or IPv6
+	// address.
+	NetNone = netaddr.IPPrefix{}
+	// PortRangeAny matches any TCP/UDP port.
+	PortRangeAny = PortRange{0, 65535}
+	// NetPortRangeAny matches any IPv4 address and any TCP/UDP port.
+	NetPortRangeAny = NetPortRange{NetAny, PortRangeAny}
+)
+
+// Match is a set of IPv4 source addresses combined with a set of
+// destination NetPortRanges.
 type Match struct {
 	Dsts []NetPortRange
-	Srcs []Net
+	Srcs []netaddr.IPPrefix
 }
 
+// Clone returns a deep copy of m.
 func (m Match) Clone() (res Match) {
-	if m.Dsts != nil {
-		res.Dsts = append([]NetPortRange{}, m.Dsts...)
-	}
-	if m.Srcs != nil {
-		res.Srcs = append([]Net{}, m.Srcs...)
-	}
+	res.Dsts = append([]NetPortRange{}, m.Dsts...)
+	res.Srcs = append([]netaddr.IPPrefix{}, m.Srcs...)
 	return res
 }
 
@@ -115,8 +90,10 @@ func (m Match) String() string {
 	return fmt.Sprintf("%v=>%v", ss, ds)
 }
 
+// Marches is a set of packet matchers.
 type Matches []Match
 
+// Clone returns a deep copy of m.
 func (m Matches) Clone() (res Matches) {
 	for _, match := range m {
 		res = append(res, match.Clone())
@@ -124,28 +101,30 @@ func (m Matches) Clone() (res Matches) {
 	return res
 }
 
-func ipInList(ip packet.IP, netlist []Net) bool {
-	for _, net := range netlist {
-		if net.Includes(ip) {
+// ipInList returns whether ip is in any of nets.
+func ipInList(ip netaddr.IP, nets []netaddr.IPPrefix) bool {
+	for _, net := range nets {
+		if net.Contains(ip) {
 			return true
 		}
 	}
 	return false
 }
 
+// matchIPPorts returns whether q matches any of mm. Note that it does
+// not check q's protocol, so its output only makes sense when q is an
+// IPv4 TCP or UDP packet.
 func matchIPPorts(mm Matches, q *packet.ParsedPacket) bool {
-	for _, acl := range mm {
-		for _, dst := range acl.Dsts {
-			if !dst.Net.Includes(q.DstIP) {
+	for _, m := range mm {
+		if !ipInList(q.Src.IP, m.Srcs) {
+			continue
+		}
+		for _, dst := range m.Dsts {
+			if !dst.Net.Contains(q.Dst.IP) {
 				continue
 			}
-			if q.DstPort < dst.Ports.First || q.DstPort > dst.Ports.Last {
+			if q.Dst.Port < dst.Ports.First || q.Dst.Port > dst.Ports.Last {
 				continue
-			}
-			if !ipInList(q.SrcIP, acl.Srcs) {
-				// Skip other dests in this acl, since
-				// the src will never match.
-				break
 			}
 			return true
 		}
@@ -153,16 +132,16 @@ func matchIPPorts(mm Matches, q *packet.ParsedPacket) bool {
 	return false
 }
 
+// matchIPWithoutPorts returns whether q matches any of mm. Only src
+// and dst IPs are checked, ports in both mm and q are ignored.
 func matchIPWithoutPorts(mm Matches, q *packet.ParsedPacket) bool {
-	for _, acl := range mm {
-		for _, dst := range acl.Dsts {
-			if !dst.Net.Includes(q.DstIP) {
+	for _, m := range mm {
+		if !ipInList(q.Src.IP, m.Srcs) {
+			continue
+		}
+		for _, dst := range m.Dsts {
+			if !dst.Net.Contains(q.Dst.IP) {
 				continue
-			}
-			if !ipInList(q.SrcIP, acl.Srcs) {
-				// Skip other dests in this acl, since
-				// the src will never match.
-				break
 			}
 			return true
 		}

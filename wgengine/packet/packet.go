@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	"inet.af/netaddr"
 	"tailscale.com/types/strbuilder"
 )
 
@@ -23,10 +24,7 @@ const (
 
 var (
 	get16 = binary.BigEndian.Uint16
-	get32 = binary.BigEndian.Uint32
-
 	put16 = binary.BigEndian.PutUint16
-	put32 = binary.BigEndian.PutUint32
 )
 
 // ParsedPacket is a minimal decoding of a packet suitable for use in filters.
@@ -43,13 +41,11 @@ type ParsedPacket struct {
 	// This is not the same as len(b) because b can have trailing zeros.
 	length int
 
-	IPVersion uint8   // 4, 6, or 0
-	IPProto   IPProto // IP subprotocol (UDP, TCP, etc); the NextHeader field for IPv6
-	SrcIP     IP      // IP source address (not used for IPv6)
-	DstIP     IP      // IP destination address (not used for IPv6)
-	SrcPort   uint16  // TCP/UDP source port
-	DstPort   uint16  // TCP/UDP destination port
-	TCPFlags  uint8   // TCP flags (SYN, ACK, etc)
+	IPVersion uint8          // 4, 6, or 0
+	IPProto   IPProto        // IP subprotocol (UDP, TCP, etc); the NextHeader field for IPv6
+	Src       netaddr.IPPort // IP source address and TCP/UDP port
+	Dst       netaddr.IPPort // IP destination address and TCP/UDP port
+	TCPFlags  uint8          // TCP flags (SYN, ACK, etc)
 }
 
 // NextHeader
@@ -66,23 +62,11 @@ func (p *ParsedPacket) String() string {
 	sb := strbuilder.Get()
 	sb.WriteString(p.IPProto.String())
 	sb.WriteByte('{')
-	writeIPPort(sb, p.SrcIP, p.SrcPort)
+	sb.WriteString(p.Src.String())
 	sb.WriteString(" > ")
-	writeIPPort(sb, p.DstIP, p.DstPort)
+	sb.WriteString(p.Dst.String())
 	sb.WriteByte('}')
 	return sb.String()
-}
-
-func writeIPPort(sb *strbuilder.Builder, ip IP, port uint16) {
-	sb.WriteUint(uint64(byte(ip >> 24)))
-	sb.WriteByte('.')
-	sb.WriteUint(uint64(byte(ip >> 16)))
-	sb.WriteByte('.')
-	sb.WriteUint(uint64(byte(ip >> 8)))
-	sb.WriteByte('.')
-	sb.WriteUint(uint64(byte(ip)))
-	sb.WriteByte(':')
-	sb.WriteUint(uint64(port))
 }
 
 // based on https://tools.ietf.org/html/rfc1071
@@ -122,16 +106,17 @@ func (q *ParsedPacket) Decode(b []byte) {
 	q.IPVersion = (b[0] & 0xF0) >> 4
 	switch q.IPVersion {
 	case 4:
-		q.IPProto = IPProto(b[9])
+		q.decode4(b)
 	case 6:
 		q.IPProto = IPProto(b[6]) // "Next Header" field
-		return
 	default:
 		q.IPVersion = 0
 		q.IPProto = Unknown
-		return
 	}
+}
 
+func (q *ParsedPacket) decode4(b []byte) {
+	q.IPProto = IPProto(b[9])
 	q.length = int(get16(b[2:4]))
 	if len(b) < q.length {
 		// Packet was cut off before full IPv4 length.
@@ -139,11 +124,10 @@ func (q *ParsedPacket) Decode(b []byte) {
 		return
 	}
 
-	// If it's valid IPv4, then the IP addresses are valid
-	q.SrcIP = IP(get32(b[12:16]))
-	q.DstIP = IP(get32(b[16:20]))
-
+	q.Src.IP = netaddr.IPv4(b[12], b[13], b[14], b[15])
+	q.Dst.IP = netaddr.IPv4(b[16], b[17], b[18], b[19])
 	q.subofs = int((b[0] & 0x0F) << 2)
+
 	sub := b[q.subofs:]
 
 	// We don't care much about IP fragmentation, except insofar as it's
@@ -177,8 +161,8 @@ func (q *ParsedPacket) Decode(b []byte) {
 				q.IPProto = Unknown
 				return
 			}
-			q.SrcPort = 0
-			q.DstPort = 0
+			q.Src.Port = 0
+			q.Dst.Port = 0
 			q.dataofs = q.subofs + icmpHeaderLength
 			return
 		case TCP:
@@ -186,8 +170,8 @@ func (q *ParsedPacket) Decode(b []byte) {
 				q.IPProto = Unknown
 				return
 			}
-			q.SrcPort = get16(sub[0:2])
-			q.DstPort = get16(sub[2:4])
+			q.Src.Port = get16(sub[0:2])
+			q.Dst.Port = get16(sub[2:4])
 			q.TCPFlags = sub[13] & 0x3F
 			headerLength := (sub[12] & 0xF0) >> 2
 			q.dataofs = q.subofs + int(headerLength)
@@ -197,8 +181,8 @@ func (q *ParsedPacket) Decode(b []byte) {
 				q.IPProto = Unknown
 				return
 			}
-			q.SrcPort = get16(sub[0:2])
-			q.DstPort = get16(sub[2:4])
+			q.Src.Port = get16(sub[0:2])
+			q.Dst.Port = get16(sub[2:4])
 			q.dataofs = q.subofs + udpHeaderLength
 			return
 		default:
@@ -229,8 +213,8 @@ func (q *ParsedPacket) IPHeader() IPHeader {
 	return IPHeader{
 		IPID:    ipid,
 		IPProto: q.IPProto,
-		SrcIP:   q.SrcIP,
-		DstIP:   q.DstIP,
+		SrcIP:   q.Src.IP,
+		DstIP:   q.Dst.IP,
 	}
 }
 
@@ -245,8 +229,8 @@ func (q *ParsedPacket) ICMPHeader() ICMPHeader {
 func (q *ParsedPacket) UDPHeader() UDPHeader {
 	return UDPHeader{
 		IPHeader: q.IPHeader(),
-		SrcPort:  q.SrcPort,
-		DstPort:  q.DstPort,
+		SrcPort:  q.Src.Port,
+		DstPort:  q.Dst.Port,
 	}
 }
 

@@ -4,48 +4,7 @@
 
 package packet
 
-import (
-	"fmt"
-	"net"
-
-	"inet.af/netaddr"
-)
-
-// IP is an IPv4 address.
-type IP uint32
-
-// NewIP converts a standard library IP address into an IP.
-// It panics if b is not an IPv4 address.
-func NewIP(b net.IP) IP {
-	b4 := b.To4()
-	if b4 == nil {
-		panic(fmt.Sprintf("To4(%v) failed", b))
-	}
-	return IP(get32(b4))
-}
-
-// IPFromNetaddr converts a netaddr.IP to an IP.
-func IPFromNetaddr(ip netaddr.IP) IP {
-	ipbytes := ip.As4()
-	return IP(get32(ipbytes[:]))
-}
-
-// Netaddr converts an IP to a netaddr.IP.
-func (ip IP) Netaddr() netaddr.IP {
-	return netaddr.IPv4(byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
-}
-
-func (ip IP) String() string {
-	return fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
-}
-
-func (ip IP) IsMulticast() bool {
-	return byte(ip>>24)&0xf0 == 0xe0
-}
-
-func (ip IP) IsLinkLocalUnicast() bool {
-	return byte(ip>>24) == 169 && byte(ip>>16) == 254
-}
+import "inet.af/netaddr"
 
 // IPProto is either a real IP protocol (ITCP, UDP, ...) or an special value like Unknown.
 // If it is a real IP protocol, its value corresponds to its IP protocol number.
@@ -84,8 +43,8 @@ func (p IPProto) String() string {
 type IPHeader struct {
 	IPProto IPProto
 	IPID    uint16
-	SrcIP   IP
-	DstIP   IP
+	SrcIP   netaddr.IP
+	DstIP   netaddr.IP
 }
 
 const ipHeaderLength = 20
@@ -110,8 +69,9 @@ func (h IPHeader) Marshal(buf []byte) error {
 	buf[8] = 64        // TTL
 	buf[9] = uint8(h.IPProto)
 	put16(buf[10:12], 0) // blank IP header checksum
-	put32(buf[12:16], uint32(h.SrcIP))
-	put32(buf[16:20], uint32(h.DstIP))
+	src, dst := h.SrcIP.As4(), h.DstIP.As4()
+	copy(buf[12:16], src[:])
+	copy(buf[16:20], dst[:])
 
 	put16(buf[10:12], ipChecksum(buf[0:20]))
 
@@ -131,8 +91,9 @@ func (h IPHeader) MarshalPseudo(buf []byte) error {
 	}
 
 	length := len(buf) - ipHeaderLength
-	put32(buf[8:12], uint32(h.SrcIP))
-	put32(buf[12:16], uint32(h.DstIP))
+	src, dst := h.SrcIP.As4(), h.DstIP.As4()
+	copy(buf[8:12], src[:])
+	copy(buf[12:16], dst[:])
 	buf[16] = 0x0
 	buf[17] = uint8(h.IPProto)
 	put16(buf[18:20], uint16(length))

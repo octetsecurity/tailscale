@@ -7,18 +7,18 @@ package filter
 
 import (
 	"fmt"
-	"net"
 	"sync"
 	"time"
 
 	"github.com/golang/groupcache/lru"
 	"golang.org/x/time/rate"
+	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/packet"
 )
 
-type filterState struct {
+type state struct {
 	mu  sync.Mutex
 	lru *lru.Cache // of tuple
 }
@@ -30,7 +30,7 @@ type Filter struct {
 	// to this node. All packets coming in over tailscale must have a
 	// destination within localNets, regardless of the policy filter
 	// below. A nil localNets rejects all incoming traffic.
-	localNets []Net
+	localNets []netaddr.IPPrefix
 	// matches is a list of match->action rules applied to all packets
 	// arriving over tailscale tunnels. Matches are checked in order,
 	// and processing stops at the first matching rule. The default
@@ -40,7 +40,7 @@ type Filter struct {
 	// filter. It is used to allow incoming traffic that is a response
 	// to an outbound connection that this node made, even if those
 	// incoming packets don't get accepted by matches above.
-	state *filterState
+	state *state
 }
 
 // Response is a verdict: either a Drop, Accept, or noVerdict skip to
@@ -77,23 +77,22 @@ const (
 )
 
 type tuple struct {
-	SrcIP   packet.IP
-	DstIP   packet.IP
-	SrcPort uint16
-	DstPort uint16
+	Src netaddr.IPPort
+	Dst netaddr.IPPort
 }
 
 const lruMax = 512 // max entries in UDP LRU cache
 
-// MatchAllowAll matches all packets.
-var MatchAllowAll = Matches{
-	Match{[]NetPortRange{NetPortRangeAny}, []Net{NetAny}},
-}
-
 // NewAllowAll returns a packet filter that accepts everything to and
 // from localNets.
-func NewAllowAll(localNets []Net, logf logger.Logf) *Filter {
-	return New(MatchAllowAll, localNets, nil, logf)
+func NewAllowAll(localNets []netaddr.IPPrefix, logf logger.Logf) *Filter {
+	maa := Matches{
+		{
+			Dsts: []NetPortRange{NetPortRangeAny},
+			Srcs: []netaddr.IPPrefix{NetAny},
+		},
+	}
+	return New(maa, localNets, nil, logf)
 }
 
 // NewAllowNone returns a packet filter that rejects everything.
@@ -106,12 +105,12 @@ func NewAllowNone(logf logger.Logf) *Filter {
 // by matches. If shareStateWith is non-nil, the returned filter
 // shares state with the previous one, to enable rules to be changed
 // at runtime without breaking existing flows.
-func New(matches Matches, localNets []Net, shareStateWith *Filter, logf logger.Logf) *Filter {
-	var state *filterState
+func New(matches Matches, localNets []netaddr.IPPrefix, shareStateWith *Filter, logf logger.Logf) *Filter {
+	var st *state
 	if shareStateWith != nil {
-		state = shareStateWith.state
+		st = shareStateWith.state
 	} else {
-		state = &filterState{
+		st = &state{
 			lru: lru.New(lruMax),
 		}
 	}
@@ -119,7 +118,7 @@ func New(matches Matches, localNets []Net, shareStateWith *Filter, logf logger.L
 		logf:      logf,
 		matches:   matches,
 		localNets: localNets,
-		state:     state,
+		state:     st,
 	}
 	return f
 }
@@ -179,27 +178,24 @@ func MatchesFromFilterRules(pf []tailcfg.FilterRule) (Matches, error) {
 	return mm, erracc
 }
 
-func parseIP(host string, defaultBits int) (Net, error) {
-	ip := net.ParseIP(host)
-	if ip != nil && ip.IsUnspecified() {
+func parseIP(host string, defaultBits int) (netaddr.IPPrefix, error) {
+	ip, err := netaddr.ParseIP(host)
+	if err == nil && ip == netaddr.IPv4(0, 0, 0, 0) {
 		// For clarity, reject 0.0.0.0 as an input
 		return NetNone, fmt.Errorf("ports=%#v: to allow all IP addresses, use *:port, not 0.0.0.0:port", host)
-	} else if ip == nil && host == "*" {
+	} else if err != nil && host == "*" {
 		// User explicitly requested wildcard dst ip
 		return NetAny, nil
 	} else {
-		if ip != nil {
-			ip = ip.To4()
-		}
-		if ip == nil || len(ip) != 4 {
+		if !ip.Is4() {
 			return NetNone, fmt.Errorf("ports=%#v: invalid IPv4 address", host)
 		}
-		if len(ip) == 4 && (defaultBits < 0 || defaultBits > 32) {
+		if defaultBits < 0 || defaultBits > 32 {
 			return NetNone, fmt.Errorf("invalid CIDR size %d for host %q", defaultBits, host)
 		}
-		return Net{
-			IP:   NewIP(ip),
-			Mask: Netmask(defaultBits),
+		return netaddr.IPPrefix{
+			IP:   ip,
+			Bits: uint8(defaultBits),
 		}, nil
 	}
 }
@@ -266,7 +262,7 @@ func (f *Filter) runIn(q *packet.ParsedPacket) (r Response, why string) {
 	// A compromised peer could try to send us packets for
 	// destinations we didn't explicitly advertise. This check is to
 	// prevent that.
-	if !ipInList(q.DstIP, f.localNets) {
+	if !ipInList(q.Dst.IP, f.localNets) {
 		return Drop, "destination not allowed"
 	}
 
@@ -304,7 +300,7 @@ func (f *Filter) runIn(q *packet.ParsedPacket) (r Response, why string) {
 			return Accept, "tcp ok"
 		}
 	case packet.UDP:
-		t := tuple{q.SrcIP, q.DstIP, q.SrcPort, q.DstPort}
+		t := tuple{q.Src, q.Dst}
 
 		f.state.mu.Lock()
 		_, ok := f.state.lru.Get(t)
@@ -324,7 +320,7 @@ func (f *Filter) runIn(q *packet.ParsedPacket) (r Response, why string) {
 
 func (f *Filter) runOut(q *packet.ParsedPacket) (r Response, why string) {
 	if q.IPProto == packet.UDP {
-		t := tuple{q.DstIP, q.SrcIP, q.DstPort, q.SrcPort}
+		t := tuple{q.Dst, q.Src}
 		var ti interface{} = t // allocate once, rather than twice inside mutex
 
 		f.state.mu.Lock()
@@ -367,11 +363,11 @@ func (f *Filter) pre(q *packet.ParsedPacket, rf RunFlags, dir direction) Respons
 		f.logRateLimit(rf, q, dir, Drop, "ipv6")
 		return Drop
 	}
-	if q.DstIP.IsMulticast() {
+	if q.Dst.IP.IsMulticast() {
 		f.logRateLimit(rf, q, dir, Drop, "multicast")
 		return Drop
 	}
-	if q.DstIP.IsLinkLocalUnicast() {
+	if q.Dst.IP.IsLinkLocalUnicast() {
 		f.logRateLimit(rf, q, dir, Drop, "link-local-unicast")
 		return Drop
 	}
@@ -418,7 +414,7 @@ func omitDropLogging(p *packet.ParsedPacket, dir direction) bool {
 			if ipProto == packet.IGMP {
 				return true
 			}
-			if p.DstIP.IsMulticast() || p.DstIP.IsLinkLocalUnicast() {
+			if p.Dst.IP.IsMulticast() || p.Dst.IP.IsLinkLocalUnicast() {
 				return true
 			}
 		case 6:

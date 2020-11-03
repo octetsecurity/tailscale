@@ -11,12 +11,13 @@ import (
 	"unsafe"
 
 	"github.com/tailscale/wireguard-go/tun/tuntest"
+	"inet.af/netaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/packet"
 )
 
-func udp(src, dst packet.IP, sport, dport uint16) []byte {
+func udp(src, dst netaddr.IP, sport, dport uint16) []byte {
 	header := &packet.UDPHeader{
 		IPHeader: packet.IPHeader{
 			SrcIP: src,
@@ -29,22 +30,26 @@ func udp(src, dst packet.IP, sport, dport uint16) []byte {
 	return packet.Generate(header, []byte("udp_payload"))
 }
 
-func filterNet(ip, mask packet.IP) filter.Net {
-	return filter.Net{IP: ip, Mask: mask}
+func mustip(s string) netaddr.IP {
+	ret, err := netaddr.ParseIP(s)
+	if err != nil {
+		panic(err)
+	}
+	return ret
 }
 
-func nets(ips []packet.IP) []filter.Net {
-	out := make([]filter.Net, 0, len(ips))
+func nets(ips ...netaddr.IP) []netaddr.IPPrefix {
+	out := make([]netaddr.IPPrefix, 0, len(ips))
 	for _, ip := range ips {
-		out = append(out, filterNet(ip, filter.Netmask(32)))
+		out = append(out, netaddr.IPPrefix{IP: ip, Bits: 32})
 	}
 	return out
 }
 
-func ippr(ip packet.IP, start, end uint16) []filter.NetPortRange {
+func ippr(ip netaddr.IP, start, end uint16) []filter.NetPortRange {
 	return []filter.NetPortRange{
 		filter.NetPortRange{
-			Net:   filterNet(ip, filter.Netmask(32)),
+			Net:   netaddr.IPPrefix{IP: ip, Bits: 32},
 			Ports: filter.PortRange{First: start, Last: end},
 		},
 	}
@@ -52,12 +57,10 @@ func ippr(ip packet.IP, start, end uint16) []filter.NetPortRange {
 
 func setfilter(logf logger.Logf, tun *TUN) {
 	matches := filter.Matches{
-		{Srcs: nets([]packet.IP{0x05060708}), Dsts: ippr(0x01020304, 89, 90)},
-		{Srcs: nets([]packet.IP{0x01020304}), Dsts: ippr(0x05060708, 98, 98)},
+		{Srcs: nets(mustip("5.6.7.8")), Dsts: ippr(mustip("1.2.3.4"), 89, 90)},
+		{Srcs: nets(mustip("1.2.3.4")), Dsts: ippr(mustip("5.6.7.8"), 98, 98)},
 	}
-	localNets := []filter.Net{
-		filterNet(packet.IP(0x01020304), filter.Netmask(16)),
-	}
+	localNets := []netaddr.IPPrefix{{IP: mustip("1.2.3.4"), Bits: 16}}
 	tun.SetFilter(filter.New(matches, localNets, nil, logf))
 }
 
@@ -207,12 +210,12 @@ func TestFilter(t *testing.T) {
 	}{
 		{"junk_in", in, true, []byte("\x45not a valid IPv4 packet")},
 		{"junk_out", out, true, []byte("\x45not a valid IPv4 packet")},
-		{"bad_port_in", in, true, udp(0x05060708, 0x01020304, 22, 22)},
-		{"bad_port_out", out, false, udp(0x01020304, 0x05060708, 22, 22)},
-		{"bad_ip_in", in, true, udp(0x08010101, 0x01020304, 89, 89)},
-		{"bad_ip_out", out, false, udp(0x01020304, 0x08010101, 98, 98)},
-		{"good_packet_in", in, false, udp(0x05060708, 0x01020304, 89, 89)},
-		{"good_packet_out", out, false, udp(0x01020304, 0x05060708, 98, 98)},
+		{"bad_port_in", in, true, udp(mustip("5.6.7.8"), mustip("1.2.3.4"), 22, 22)},
+		{"bad_port_out", out, false, udp(mustip("1.2.3.4"), mustip("5.6.7.8"), 22, 22)},
+		{"bad_ip_in", in, true, udp(mustip("8.1.1.1"), mustip("1.2.3.4"), 89, 89)},
+		{"bad_ip_out", out, false, udp(mustip("1.2.3.4"), mustip("8.1.1.1"), 98, 98)},
+		{"good_packet_in", in, false, udp(mustip("5.6.7.8"), mustip("1.2.3.4"), 89, 89)},
+		{"good_packet_out", out, false, udp(mustip("1.2.3.4"), mustip("5.6.7.8"), 98, 98)},
 	}
 
 	// A reader on the other end of the TUN.
@@ -292,7 +295,7 @@ func BenchmarkWrite(b *testing.B) {
 	ftun, tun := newFakeTUN(b.Logf, true)
 	defer tun.Close()
 
-	packet := udp(0x05060708, 0x01020304, 89, 89)
+	packet := udp(mustip("5.6.7.8"), mustip("1.2.3.4"), 89, 89)
 	for i := 0; i < b.N; i++ {
 		_, err := ftun.Write(packet, 0)
 		if err != nil {

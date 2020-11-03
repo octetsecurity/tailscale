@@ -8,17 +8,16 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"net"
 	"strings"
 	"testing"
 
+	"inet.af/netaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/packet"
 )
 
 // Type aliases only in test code: (but ideally nowhere)
 type ParsedPacket = packet.ParsedPacket
-type IP = packet.IP
 
 var Unknown = packet.Unknown
 var ICMP = packet.ICMP
@@ -26,43 +25,89 @@ var TCP = packet.TCP
 var UDP = packet.UDP
 var Fragment = packet.Fragment
 
-func nets(ips []IP) []Net {
-	out := make([]Net, 0, len(ips))
-	for _, ip := range ips {
-		out = append(out, Net{ip, Netmask(32)})
+func mustip(s string) netaddr.IP {
+	ip, err := netaddr.ParseIP(s)
+	if err != nil {
+		panic(err)
 	}
-	return out
+	return ip
 }
 
-func ippr(ip IP, start, end uint16) []NetPortRange {
-	return []NetPortRange{
-		NetPortRange{Net{ip, Netmask(32)}, PortRange{start, end}},
+func ipp(s string) netaddr.IPPort {
+	ret, err := netaddr.ParseIPPort(s)
+	if err != nil {
+		panic(err)
 	}
+	return ret
 }
 
-func netpr(ip IP, bits int, start, end uint16) []NetPortRange {
-	return []NetPortRange{
-		NetPortRange{Net{ip, Netmask(bits)}, PortRange{start, end}},
+func pfx(s string) netaddr.IPPrefix {
+	p, err := netaddr.ParseIPPrefix(s)
+	if err != nil {
+		panic(err)
 	}
+	return p
+}
+
+func nets(ss ...string) []netaddr.IPPrefix {
+	var ret []netaddr.IPPrefix
+	for _, s := range ss {
+		ip, err := netaddr.ParseIP(s)
+		if err != nil {
+			panic(err)
+		}
+		ret = append(ret, netaddr.IPPrefix{IP: ip, Bits: 32})
+	}
+	return ret
+}
+
+func netpr(s string, bits uint8, start, end uint16) NetPortRange {
+	ip, err := netaddr.ParseIP(s)
+	if err != nil {
+		panic(err)
+	}
+	return NetPortRange{netaddr.IPPrefix{IP: ip, Bits: bits}, PortRange{start, end}}
+}
+
+func netprs(ip string, bits uint8, start, end uint16) []NetPortRange {
+	return []NetPortRange{netpr(ip, bits, start, end)}
 }
 
 var matches = Matches{
-	{Srcs: nets([]IP{0x08010101, 0x08020202}), Dsts: []NetPortRange{
-		NetPortRange{Net{0x01020304, Netmask(32)}, PortRange{22, 22}},
-		NetPortRange{Net{0x05060708, Netmask(32)}, PortRange{23, 24}},
-	}},
-	{Srcs: nets([]IP{0x08010101, 0x08020202}), Dsts: ippr(0x05060708, 27, 28)},
-	{Srcs: nets([]IP{0x02020202}), Dsts: ippr(0x08010101, 22, 22)},
-	{Srcs: []Net{NetAny}, Dsts: ippr(0x647a6232, 0, 65535)},
-	{Srcs: []Net{NetAny}, Dsts: netpr(0, 0, 443, 443)},
-	{Srcs: nets([]IP{0x99010101, 0x99010102, 0x99030303}), Dsts: ippr(0x01020304, 999, 999)},
+	{
+		Srcs: nets("8.1.1.1", "8.2.2.2"),
+		Dsts: []NetPortRange{
+			netpr("1.2.3.4", 32, 22, 22),
+			netpr("5.6.7.8", 32, 23, 24),
+		},
+	},
+	{
+		Srcs: nets("8.1.1.1", "8.2.2.2"),
+		Dsts: netprs("5.6.7.8", 32, 27, 28),
+	},
+	{
+		Srcs: nets("2.2.2.2"),
+		Dsts: netprs("8.1.1.1", 32, 22, 22),
+	},
+	{
+		Srcs: []netaddr.IPPrefix{NetAny},
+		Dsts: netprs("100.122.98.50", 32, 0, 65535),
+	},
+	{
+		Srcs: []netaddr.IPPrefix{NetAny},
+		Dsts: netprs("0.0.0.0", 0, 443, 443),
+	},
+	{
+		Srcs: nets("153.1.1.1", "153.1.1.2", "153.3.3.3"),
+		Dsts: netprs("1.2.3.4", 32, 999, 999),
+	},
 }
 
 func newFilter(logf logger.Logf) *Filter {
 	// Expects traffic to 100.122.98.50, 1.2.3.4, 5.6.7.8,
 	// 102.102.102.102, 119.119.119.119, 8.1.0.0/16
-	localNets := nets([]IP{0x647a6232, 0x01020304, 0x05060708, 0x66666666, 0x77777777})
-	localNets = append(localNets, Net{IP(0x08010000), Netmask(16)})
+	localNets := nets("100.122.98.50", "1.2.3.4", "5.6.7.8", "102.102.102.102", "119.119.119.119")
+	localNets = append(localNets, pfx("8.1.0.0/16"))
 
 	return New(matches, localNets, nil, logf)
 }
@@ -91,30 +136,30 @@ func TestFilter(t *testing.T) {
 	}
 	tests := []InOut{
 		// Basic
-		{Accept, parsed(TCP, 0x08010101, 0x01020304, 999, 22)},
-		{Accept, parsed(UDP, 0x08010101, 0x01020304, 999, 22)},
-		{Accept, parsed(ICMP, 0x08010101, 0x01020304, 0, 0)},
-		{Drop, parsed(TCP, 0x08010101, 0x01020304, 0, 0)},
-		{Accept, parsed(TCP, 0x08010101, 0x01020304, 0, 22)},
-		{Drop, parsed(TCP, 0x08010101, 0x01020304, 0, 21)},
-		{Accept, parsed(TCP, 0x11223344, 0x08012233, 0, 443)},
-		{Drop, parsed(TCP, 0x11223344, 0x08012233, 0, 444)},
-		{Accept, parsed(TCP, 0x11223344, 0x647a6232, 0, 999)},
-		{Accept, parsed(TCP, 0x11223344, 0x647a6232, 0, 0)},
+		{Accept, parsed(TCP, mustip("8.1.1.1"), mustip("1.2.3.4"), 999, 22)},
+		{Accept, parsed(UDP, mustip("8.1.1.1"), mustip("1.2.3.4"), 999, 22)},
+		{Accept, parsed(ICMP, mustip("8.1.1.1"), mustip("1.2.3.4"), 0, 0)},
+		{Drop, parsed(TCP, mustip("8.1.1.1"), mustip("1.2.3.4"), 0, 0)},
+		{Accept, parsed(TCP, mustip("8.1.1.1"), mustip("1.2.3.4"), 0, 22)},
+		{Drop, parsed(TCP, mustip("8.1.1.1"), mustip("1.2.3.4"), 0, 21)},
+		{Accept, parsed(TCP, mustip("17.34.51.68"), mustip("8.1.34.51"), 0, 443)},
+		{Drop, parsed(TCP, mustip("17.34.51.68"), mustip("8.1.34.51"), 0, 444)},
+		{Accept, parsed(TCP, mustip("17.34.51.68"), mustip("100.122.98.50"), 0, 999)},
+		{Accept, parsed(TCP, mustip("17.34.51.68"), mustip("100.122.98.50"), 0, 0)},
 
 		// localNets prefilter - accepted by policy filter, but
 		// unexpected dst IP.
-		{Drop, parsed(TCP, 0x08010101, 0x10203040, 0, 443)},
+		{Drop, parsed(TCP, mustip("8.1.1.1"), mustip("16.32.48.64"), 0, 443)},
 
 		// Stateful UDP. Note each packet is run through the input
 		// filter, then the output filter (which sets conntrack
 		// state).
 		// Initially empty cache
-		{Drop, parsed(UDP, 0x77777777, 0x66666666, 4242, 4343)},
+		{Drop, parsed(UDP, mustip("119.119.119.119"), mustip("102.102.102.102"), 4242, 4343)},
 		// Return packet from previous attempt is allowed
-		{Accept, parsed(UDP, 0x66666666, 0x77777777, 4343, 4242)},
+		{Accept, parsed(UDP, mustip("102.102.102.102"), mustip("119.119.119.119"), 4343, 4242)},
 		// Because of the return above, initial attempt is allowed now
-		{Accept, parsed(UDP, 0x77777777, 0x66666666, 4242, 4343)},
+		{Accept, parsed(UDP, mustip("119.119.119.119"), mustip("102.102.102.102"), 4242, 4343)},
 	}
 	for i, test := range tests {
 		if got, _ := acl.runIn(&test.p); test.want != got {
@@ -128,8 +173,8 @@ func TestFilter(t *testing.T) {
 func TestNoAllocs(t *testing.T) {
 	acl := newFilter(t.Logf)
 
-	tcpPacket := rawpacket(TCP, 0x08010101, 0x01020304, 999, 22, 0)
-	udpPacket := rawpacket(UDP, 0x08010101, 0x01020304, 999, 22, 0)
+	tcpPacket := rawpacket(TCP, mustip("8.1.1.1"), mustip("1.2.3.4"), 999, 22, 0)
+	udpPacket := rawpacket(UDP, mustip("8.1.1.1"), mustip("1.2.3.4"), 999, 22, 0)
 
 	tests := []struct {
 		name   string
@@ -137,11 +182,11 @@ func TestNoAllocs(t *testing.T) {
 		want   int
 		packet []byte
 	}{
-		{"tcp_in", true, 0, tcpPacket},
-		{"tcp_out", false, 0, tcpPacket},
-		{"udp_in", true, 0, udpPacket},
+		{"tcp_in", true, 2, tcpPacket},
+		{"tcp_out", false, 2, tcpPacket},
+		{"udp_in", true, 2, udpPacket},
 		// One alloc is inevitable (an lru cache update)
-		{"udp_out", false, 1, udpPacket},
+		{"udp_out", false, 3, udpPacket},
 	}
 
 	for _, test := range tests {
@@ -167,13 +212,13 @@ func TestParseIP(t *testing.T) {
 	tests := []struct {
 		host    string
 		bits    int
-		want    Net
+		want    netaddr.IPPrefix
 		wantErr string
 	}{
-		{"8.8.8.8", 24, Net{IP: packet.NewIP(net.ParseIP("8.8.8.8")), Mask: packet.NewIP(net.ParseIP("255.255.255.0"))}, ""},
-		{"8.8.8.8", 33, Net{}, `invalid CIDR size 33 for host "8.8.8.8"`},
-		{"8.8.8.8", -1, Net{}, `invalid CIDR size -1 for host "8.8.8.8"`},
-		{"0.0.0.0", 24, Net{}, `ports="0.0.0.0": to allow all IP addresses, use *:port, not 0.0.0.0:port`},
+		{"8.8.8.8", 24, pfx("8.8.8.8/24"), ""},
+		{"8.8.8.8", 33, netaddr.IPPrefix{}, `invalid CIDR size 33 for host "8.8.8.8"`},
+		{"8.8.8.8", -1, netaddr.IPPrefix{}, `invalid CIDR size -1 for host "8.8.8.8"`},
+		{"0.0.0.0", 24, netaddr.IPPrefix{}, `ports="0.0.0.0": to allow all IP addresses, use *:port, not 0.0.0.0:port`},
 		{"*", 24, NetAny, ""},
 		{"fe80::1", 128, NetNone, `ports="fe80::1": invalid IPv4 address`},
 	}
@@ -195,11 +240,11 @@ func TestParseIP(t *testing.T) {
 func BenchmarkFilter(b *testing.B) {
 	acl := newFilter(b.Logf)
 
-	tcpPacket := rawpacket(TCP, 0x08010101, 0x01020304, 999, 22, 0)
-	udpPacket := rawpacket(UDP, 0x08010101, 0x01020304, 999, 22, 0)
-	icmpPacket := rawpacket(ICMP, 0x08010101, 0x01020304, 0, 0, 0)
+	tcpPacket := rawpacket(TCP, mustip("8.1.1.1"), mustip("1.2.3.4"), 999, 22, 0)
+	udpPacket := rawpacket(UDP, mustip("8.1.1.1"), mustip("1.2.3.4"), 999, 22, 0)
+	icmpPacket := rawpacket(ICMP, mustip("8.1.1.1"), mustip("1.2.3.4"), 0, 0, 0)
 
-	tcpSynPacket := rawpacket(TCP, 0x08010101, 0x01020304, 999, 22, 0)
+	tcpSynPacket := rawpacket(TCP, mustip("8.1.1.1"), mustip("1.2.3.4"), 999, 22, 0)
 	// TCP filtering is trivial (Accept) for non-SYN packets.
 	tcpSynPacket[33] = packet.TCPSyn
 
@@ -258,20 +303,18 @@ func TestPreFilter(t *testing.T) {
 	}
 }
 
-func parsed(proto packet.IPProto, src, dst packet.IP, sport, dport uint16) ParsedPacket {
+func parsed(proto packet.IPProto, src, dst netaddr.IP, sport, dport uint16) ParsedPacket {
 	return ParsedPacket{
 		IPProto:  proto,
-		SrcIP:    src,
-		DstIP:    dst,
-		SrcPort:  sport,
-		DstPort:  dport,
+		Src:      netaddr.IPPort{IP: src, Port: sport},
+		Dst:      netaddr.IPPort{IP: dst, Port: dport},
 		TCPFlags: packet.TCPSyn,
 	}
 }
 
 // rawpacket generates a packet with given source and destination ports and IPs
 // and resizes the header to trimLength if it is nonzero.
-func rawpacket(proto packet.IPProto, src, dst packet.IP, sport, dport uint16, trimLength int) []byte {
+func rawpacket(proto packet.IPProto, src, dst netaddr.IP, sport, dport uint16, trimLength int) []byte {
 	var headerLength int
 
 	switch proto {
@@ -296,8 +339,9 @@ func rawpacket(proto packet.IPProto, src, dst packet.IP, sport, dport uint16, tr
 	hdr[0] = 0x45
 	bin.PutUint16(hdr[2:4], uint16(trimLength))
 	hdr[8] = 64
-	bin.PutUint32(hdr[12:16], uint32(src))
-	bin.PutUint32(hdr[16:20], uint32(dst))
+	s, d := src.As4(), dst.As4()
+	copy(hdr[12:16], s[:])
+	copy(hdr[16:20], d[:])
 	// ports
 	bin.PutUint16(hdr[20:22], sport)
 	bin.PutUint16(hdr[22:24], dport)
@@ -326,7 +370,7 @@ func rawpacket(proto packet.IPProto, src, dst packet.IP, sport, dport uint16, tr
 
 // rawdefault calls rawpacket with default ports and IPs.
 func rawdefault(proto packet.IPProto, trimLength int) []byte {
-	ip := IP(0x08080808) // 8.8.8.8
+	ip := mustip("8.8.8.8")
 	port := uint16(53)
 	return rawpacket(proto, ip, ip, port, port, trimLength)
 }
@@ -381,19 +425,19 @@ func TestOmitDropLogging(t *testing.T) {
 		},
 		{
 			name: "v4_multicast_out_low",
-			pkt:  &packet.ParsedPacket{IPVersion: 4, DstIP: packet.NewIP(net.ParseIP("224.0.0.0"))},
+			pkt:  &packet.ParsedPacket{IPVersion: 4, Dst: ipp("224.0.0.0:0")},
 			dir:  out,
 			want: true,
 		},
 		{
 			name: "v4_multicast_out_high",
-			pkt:  &packet.ParsedPacket{IPVersion: 4, DstIP: packet.NewIP(net.ParseIP("239.255.255.255"))},
+			pkt:  &packet.ParsedPacket{IPVersion: 4, Dst: ipp("239.255.255.255:0")},
 			dir:  out,
 			want: true,
 		},
 		{
 			name: "v4_link_local_unicast",
-			pkt:  &packet.ParsedPacket{IPVersion: 4, DstIP: packet.NewIP(net.ParseIP("169.254.1.2"))},
+			pkt:  &packet.ParsedPacket{IPVersion: 4, Dst: ipp("169.254.1.2:0")},
 			dir:  out,
 			want: true,
 		},
