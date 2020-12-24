@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"tailscale.com/logtail/backoff"
@@ -23,34 +24,6 @@ import (
 // DefaultHost is the default host name to upload logs to when
 // Config.BaseURL isn't provided.
 const DefaultHost = "log.tailscale.io"
-
-type Logger interface {
-	// Write logs an encoded JSON blob.
-	//
-	// If the []byte passed to Write is not an encoded JSON blob,
-	// then contents is fit into a JSON blob and written.
-	//
-	// This is intended as an interface for the stdlib "log" package.
-	Write([]byte) (int, error)
-
-	// Flush uploads all logs to the server.
-	// It blocks until complete or there is an unrecoverable error.
-	Flush() error
-
-	// Shutdown gracefully shuts down the logger while completing any
-	// remaining uploads.
-	//
-	// It will block, continuing to try and upload unless the passed
-	// context object interrupts it by being done.
-	// If the shutdown is interrupted, an error is returned.
-	Shutdown(context.Context) error
-
-	// Close shuts down this logger object, the background log uploader
-	// process, and any associated goroutines.
-	//
-	// DEPRECATED: use Shutdown
-	Close()
-}
 
 type Encoder interface {
 	EncodeAll(src, dst []byte) []byte
@@ -66,15 +39,16 @@ type Config struct {
 	LowMemory      bool             // if true, logtail minimizes memory use
 	TimeNow        func() time.Time // if set, subsitutes uses of time.Now
 	Stderr         io.Writer        // if set, logs are sent here instead of os.Stderr
+	StderrLevel    int              // max verbosity level to write to stderr; 0 means the non-verbose messages only
 	Buffer         Buffer           // temp storage, if nil a MemoryBuffer
 	NewZstdEncoder func() Encoder   // if set, used to compress logs for transmission
 
-	// DrainLogs, if non-nil, disables autmatic uploading of new logs,
+	// DrainLogs, if non-nil, disables automatic uploading of new logs,
 	// so that logs are only uploaded when a token is sent to DrainLogs.
 	DrainLogs <-chan struct{}
 }
 
-func Log(cfg Config, logf tslogger.Logf) Logger {
+func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://" + DefaultHost
 	}
@@ -94,8 +68,9 @@ func Log(cfg Config, logf tslogger.Logf) Logger {
 		}
 		cfg.Buffer = NewMemoryBuffer(pendingSize)
 	}
-	l := &logger{
+	l := &Logger{
 		stderr:         cfg.Stderr,
+		stderrLevel:    cfg.StderrLevel,
 		httpc:          cfg.HTTPC,
 		url:            cfg.BaseURL + "/c/" + cfg.Collection + "/" + cfg.PrivateID.String(),
 		lowMem:         cfg.LowMemory,
@@ -122,8 +97,11 @@ func Log(cfg Config, logf tslogger.Logf) Logger {
 	return l
 }
 
-type logger struct {
+// Logger writes logs, splitting them as configured between local
+// logging facilities and uploading to a log server.
+type Logger struct {
 	stderr         io.Writer
+	stderrLevel    int
 	httpc          *http.Client
 	url            string
 	lowMem         bool
@@ -141,7 +119,22 @@ type logger struct {
 	shutdownDone  chan struct{} // closd when shutdown complete
 }
 
-func (l *logger) Shutdown(ctx context.Context) error {
+// SetVerbosityLevel controls the verbosity level that should be
+// written to stderr. 0 is the default (not verbose). Levels 1 or higher
+// are increasingly verbose.
+//
+// It should not be changed concurrently with log writes.
+func (l *Logger) SetVerbosityLevel(level int) {
+	l.stderrLevel = level
+}
+
+// Shutdown gracefully shuts down the logger while completing any
+// remaining uploads.
+//
+// It will block, continuing to try and upload unless the passed
+// context object interrupts it by being done.
+// If the shutdown is interrupted, an error is returned.
+func (l *Logger) Shutdown(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -163,7 +156,11 @@ func (l *logger) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (l *logger) Close() {
+// Close shuts down this logger object, the background log uploader
+// process, and any associated goroutines.
+//
+// Deprecated: use Shutdown
+func (l *Logger) Close() {
 	l.Shutdown(context.Background())
 }
 
@@ -174,7 +171,7 @@ func (l *logger) Close() {
 //
 // If the caller provides a DrainLogs channel, then unblock-drain-on-Write
 // is disabled, and it is up to the caller to trigger unblock the drain.
-func (l *logger) drainBlock() (shuttingDown bool) {
+func (l *Logger) drainBlock() (shuttingDown bool) {
 	if l.drainLogs == nil {
 		select {
 		case <-l.shutdownStart:
@@ -193,7 +190,7 @@ func (l *logger) drainBlock() (shuttingDown bool) {
 
 // drainPending drains and encodes a batch of logs from the buffer for upload.
 // If no logs are available, drainPending blocks until logs are available.
-func (l *logger) drainPending() (res []byte) {
+func (l *Logger) drainPending() (res []byte) {
 	buf := new(bytes.Buffer)
 	entries := 0
 
@@ -254,13 +251,22 @@ func (l *logger) drainPending() (res []byte) {
 }
 
 // This is the goroutine that repeatedly uploads logs in the background.
-func (l *logger) uploading(ctx context.Context) {
+func (l *Logger) uploading(ctx context.Context) {
 	defer close(l.shutdownDone)
 
 	for {
 		body := l.drainPending()
-		if l.zstdEncoder != nil {
-			body = l.zstdEncoder.EncodeAll(body, nil)
+		origlen := -1 // sentinel value: uncompressed
+		// Don't attempt to compress tiny bodies; not worth the CPU cycles.
+		if l.zstdEncoder != nil && len(body) > 256 {
+			zbody := l.zstdEncoder.EncodeAll(body, nil)
+			// Only send it compressed if the bandwidth savings are sufficient.
+			// Just the extra headers associated with enabling compression
+			// are 50 bytes by themselves.
+			if len(body)-len(zbody) > 64 {
+				origlen = len(body)
+				body = zbody
+			}
 		}
 
 		for len(body) > 0 {
@@ -269,7 +275,7 @@ func (l *logger) uploading(ctx context.Context) {
 				return
 			default:
 			}
-			uploaded, err := l.upload(ctx, body)
+			uploaded, err := l.upload(ctx, body, origlen)
 			if err != nil {
 				fmt.Fprintf(l.stderr, "logtail: upload: %v\n", err)
 			}
@@ -287,7 +293,10 @@ func (l *logger) uploading(ctx context.Context) {
 	}
 }
 
-func (l *logger) upload(ctx context.Context, body []byte) (uploaded bool, err error) {
+// upload uploads body to the log server.
+// origlen indicates the pre-compression body length.
+// origlen of -1 indicates that the body is not compressed.
+func (l *Logger) upload(ctx context.Context, body []byte, origlen int) (uploaded bool, err error) {
 	req, err := http.NewRequest("POST", l.url, bytes.NewReader(body))
 	if err != nil {
 		// I know of no conditions under which this could fail.
@@ -295,8 +304,9 @@ func (l *logger) upload(ctx context.Context, body []byte) (uploaded bool, err er
 		// TODO record logs to disk
 		panic("logtail: cannot build http request: " + err.Error())
 	}
-	if l.zstdEncoder != nil {
+	if origlen != -1 {
 		req.Header.Add("Content-Encoding", "zstd")
+		req.Header.Add("Orig-Content-Length", strconv.Itoa(origlen))
 	}
 	req.Header["User-Agent"] = nil // not worth writing one; save some bytes
 
@@ -306,7 +316,7 @@ func (l *logger) upload(ctx context.Context, body []byte) (uploaded bool, err er
 	req = req.WithContext(ctx)
 
 	compressedNote := "not-compressed"
-	if l.zstdEncoder != nil {
+	if origlen != -1 {
 		compressedNote = "compressed"
 	}
 
@@ -333,11 +343,13 @@ func (l *logger) upload(ctx context.Context, body []byte) (uploaded bool, err er
 	return true, nil
 }
 
-func (l *logger) Flush() error {
+// Flush uploads all logs to the server.
+// It blocks until complete or there is an unrecoverable error.
+func (l *Logger) Flush() error {
 	return nil
 }
 
-func (l *logger) send(jsonBlob []byte) (int, error) {
+func (l *Logger) send(jsonBlob []byte) (int, error) {
 	n, err := l.buffer.Write(jsonBlob)
 	if l.drainLogs == nil {
 		select {
@@ -350,7 +362,7 @@ func (l *logger) send(jsonBlob []byte) (int, error) {
 
 // TODO: instead of allocating, this should probably just append
 // directly into the output log buffer.
-func (l *logger) encodeText(buf []byte, skipClientTime bool) []byte {
+func (l *Logger) encodeText(buf []byte, skipClientTime bool) []byte {
 	now := l.timeNow()
 
 	// Factor in JSON encoding overhead to try to only do one alloc
@@ -406,7 +418,7 @@ func (l *logger) encodeText(buf []byte, skipClientTime bool) []byte {
 	return b
 }
 
-func (l *logger) encode(buf []byte) []byte {
+func (l *Logger) encode(buf []byte) []byte {
 	if buf[0] != '{' {
 		return l.encodeText(buf, l.skipClientTime) // text fast-path
 	}
@@ -447,11 +459,18 @@ func (l *logger) encode(buf []byte) []byte {
 	return b
 }
 
-func (l *logger) Write(buf []byte) (int, error) {
+// Write logs an encoded JSON blob.
+//
+// If the []byte passed to Write is not an encoded JSON blob,
+// then contents is fit into a JSON blob and written.
+//
+// This is intended as an interface for the stdlib "log" package.
+func (l *Logger) Write(buf []byte) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
-	if l.stderr != nil && l.stderr != ioutil.Discard {
+	level, buf := parseAndRemoveLogLevel(buf)
+	if l.stderr != nil && l.stderr != ioutil.Discard && level <= l.stderrLevel {
 		if buf[len(buf)-1] == '\n' {
 			l.stderr.Write(buf)
 		} else {
@@ -464,4 +483,24 @@ func (l *logger) Write(buf []byte) (int, error) {
 	b := l.encode(buf)
 	_, err := l.send(b)
 	return len(buf), err
+}
+
+var (
+	openBracketV = []byte("[v")
+	v1           = []byte("[v1] ")
+	v2           = []byte("[v2] ")
+)
+
+// level 0 is normal (or unknown) level; 1+ are increasingly verbose
+func parseAndRemoveLogLevel(buf []byte) (level int, cleanBuf []byte) {
+	if len(buf) == 0 || buf[0] == '{' || !bytes.Contains(buf, openBracketV) {
+		return 0, buf
+	}
+	if bytes.Contains(buf, v1) {
+		return 1, bytes.ReplaceAll(buf, v1, nil)
+	}
+	if bytes.Contains(buf, v2) {
+		return 2, bytes.ReplaceAll(buf, v2, nil)
+	}
+	return 0, buf
 }

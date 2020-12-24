@@ -5,6 +5,7 @@
 package interfaces
 
 import (
+	"errors"
 	"os/exec"
 
 	"go4.org/mem"
@@ -62,8 +63,12 @@ func likelyHomeRouterIPDarwinExec() (ret netaddr.IP, ok bool) {
 		ip, err := netaddr.ParseIP(string(mem.Append(nil, ipm)))
 		if err == nil && isPrivateIP(ip) {
 			ret = ip
+			// We've found what we're looking for.
+			return errStopReadingNetstatTable
 		}
 		return nil
 	})
 	return ret, !ret.IsZero()
 }
+
+var errStopReadingNetstatTable = errors.New("found private gateway")

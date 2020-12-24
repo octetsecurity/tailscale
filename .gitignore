@@ -1,12 +1,11 @@
 # Binaries for programs and plugins
 *~
+*.tmp
 *.exe
 *.dll
 *.so
 *.dylib
 
-cmd/relaynode/relaynode
-cmd/taillogin/taillogin
 cmd/tailscale/tailscale
 cmd/tailscaled/tailscaled
 

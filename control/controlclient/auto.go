@@ -182,7 +182,8 @@ func (c *Client) SetPaused(paused bool) {
 	}
 	c.paused = paused
 	if paused {
-		// Just cancel the map routine. The auth routine isn't expensive.
+		// Only cancel the map routine. (The auth routine isn't expensive
+		// so it's fine to keep it running.)
 		c.cancelMapLocked()
 	} else {
 		for _, ch := range c.unpauseWaiters {
@@ -230,7 +231,7 @@ func (c *Client) cancelMapSafely() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.logf("cancelMapSafely: synced=%v", c.synced)
+	c.logf("[v1] cancelMapSafely: synced=%v", c.synced)
 
 	if c.inPollNetMap {
 		// received at least one netmap since the last
@@ -252,12 +253,12 @@ func (c *Client) cancelMapSafely() {
 		// request.
 		select {
 		case c.newMapCh <- struct{}{}:
-			c.logf("cancelMapSafely: wrote to channel")
+			c.logf("[v1] cancelMapSafely: wrote to channel")
 		default:
 			// if channel write failed, then there was already
 			// an outstanding newMapCh request. One is enough,
 			// since it'll always use the latest endpoints.
-			c.logf("cancelMapSafely: channel was full")
+			c.logf("[v1] cancelMapSafely: channel was full")
 		}
 	}
 }
@@ -268,22 +269,24 @@ func (c *Client) authRoutine() {
 
 	for {
 		c.mu.Lock()
-		c.logf("authRoutine: %s", c.state)
-		expiry := c.expiry
 		goal := c.loginGoal
 		ctx := c.authCtx
-		synced := c.synced
+		if goal != nil {
+			c.logf("authRoutine: %s; wantLoggedIn=%v", c.state, goal.wantLoggedIn)
+		} else {
+			c.logf("authRoutine: %s; goal=nil", c.state)
+		}
 		c.mu.Unlock()
 
 		select {
 		case <-c.quit:
-			c.logf("authRoutine: quit")
+			c.logf("[v1] authRoutine: quit")
 			return
 		default:
 		}
 
 		report := func(err error, msg string) {
-			c.logf("%s: %v", msg, err)
+			c.logf("[v1] %s: %v", msg, err)
 			err = fmt.Errorf("%s: %v", msg, err)
 			// don't send status updates for context errors,
 			// since context cancelation is always on purpose.
@@ -293,51 +296,13 @@ func (c *Client) authRoutine() {
 		}
 
 		if goal == nil {
-			// Wait for something interesting to happen
-			var exp <-chan time.Time
-			var expTimer *time.Timer
-			if expiry != nil && !expiry.IsZero() {
-				// if expiry is in the future, don't delay
-				// past that time.
-				// If it's in the past, then it's already
-				// being handled by someone, so no need to
-				// wake ourselves up again.
-				now := c.timeNow()
-				if expiry.Before(now) {
-					delay := expiry.Sub(now)
-					if delay > 5*time.Second {
-						delay = time.Second
-					}
-					expTimer = time.NewTimer(delay)
-					exp = expTimer.C
-				}
-			}
-			select {
-			case <-ctx.Done():
-				if expTimer != nil {
-					expTimer.Stop()
-				}
-				c.logf("authRoutine: context done.")
-			case <-exp:
-				// Unfortunately the key expiry isn't provided
-				// by the control server until mapRequest.
-				// So we have to do some hackery with c.expiry
-				// in here.
-				// TODO(apenwarr): add a key expiry field in RegisterResponse.
-				c.logf("authRoutine: key expiration check.")
-				if synced && expiry != nil && !expiry.IsZero() && expiry.Before(c.timeNow()) {
-					c.logf("Key expired; setting loggedIn=false.")
+			// Wait for user to Login or Logout.
+			<-ctx.Done()
+			c.logf("[v1] authRoutine: context done.")
+			continue
+		}
 
-					c.mu.Lock()
-					c.loginGoal = &LoginGoal{
-						wantLoggedIn: c.loggedIn,
-					}
-					c.loggedIn = false
-					c.expiry = nil
-					c.mu.Unlock()
-				}
-			}
-		} else if !goal.wantLoggedIn {
+		if !goal.wantLoggedIn {
 			err := c.direct.TryLogout(ctx)
 			if err != nil {
 				report(err, "TryLogout")
@@ -469,7 +434,7 @@ func (c *Client) mapRoutine() {
 		}
 
 		report := func(err error, msg string) {
-			c.logf("%s: %v", msg, err)
+			c.logf("[v1] %s: %v", msg, err)
 			err = fmt.Errorf("%s: %v", msg, err)
 			// don't send status updates for context errors,
 			// since context cancelation is always on purpose.
@@ -504,7 +469,7 @@ func (c *Client) mapRoutine() {
 
 				select {
 				case <-c.newMapCh:
-					c.logf("mapRoutine: new map request during PollNetMap. canceling.")
+					c.logf("[v1] mapRoutine: new map request during PollNetMap. canceling.")
 					c.cancelMapLocked()
 
 					// Don't emit this netmap; we're
@@ -526,7 +491,7 @@ func (c *Client) mapRoutine() {
 
 				c.mu.Unlock()
 
-				c.logf("mapRoutine: netmap received: %s", state)
+				c.logf("[v1] mapRoutine: netmap received: %s", state)
 				if stillAuthed {
 					c.sendStatus("mapRoutine-got-netmap", nil, "", nm)
 				}
@@ -607,7 +572,7 @@ func (c *Client) sendStatus(who string, err error, url string, nm *NetworkMap) {
 	c.inSendStatus++
 	c.mu.Unlock()
 
-	c.logf("sendStatus: %s: %v", who, state)
+	c.logf("[v1] sendStatus: %s: %v", who, state)
 
 	var p *Persist
 	var fin *empty.Message

@@ -36,6 +36,7 @@ import (
 	"golang.org/x/oauth2"
 	"inet.af/netaddr"
 	"tailscale.com/log/logheap"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
@@ -43,7 +44,9 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/structs"
+	"tailscale.com/util/systemd"
 	"tailscale.com/version"
+	"tailscale.com/wgengine/filter"
 )
 
 type Persist struct {
@@ -172,11 +175,15 @@ func NewDirect(opts Options) (*Direct, error) {
 
 	httpc := opts.HTTPTestClient
 	if httpc == nil {
+		dnsCache := &dnscache.Resolver{
+			Forward:     dnscache.Get().Forward, // use default cache's forwarder
+			UseLastGood: true,
+		}
 		dialer := netns.NewDialer()
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.Proxy = tshttpproxy.ProxyFromEnvironment
 		tshttpproxy.SetTransportGetProxyConnectHeader(tr)
-		tr.DialContext = dialer.DialContext
+		tr.DialContext = dnscache.Dialer(dialer.DialContext, dnsCache)
 		tr.ForceAttemptHTTP2 = true
 		tr.TLSClientConfig = tlsdial.Config(serverURL.Host, tr.TLSClientConfig)
 		httpc = &http.Client{Transport: tr}
@@ -303,6 +310,7 @@ func (c *Direct) doLoginOrRegen(ctx context.Context, t *oauth2.Token, flags Logi
 	if mustregen {
 		_, url, err = c.doLogin(ctx, t, flags, true, url)
 	}
+
 	return url, err
 }
 
@@ -323,6 +331,7 @@ func (c *Direct) doLogin(ctx context.Context, t *oauth2.Token, flags LoginFlags,
 
 	if expired {
 		c.logf("Old key expired -> regen=true")
+		systemd.Status("key expired; run 'tailscale up' to authenticate")
 		regen = true
 	}
 	if (flags & LoginInteractive) != 0 {
@@ -528,15 +537,17 @@ func (c *Direct) PollNetMap(ctx context.Context, maxPolls int, cb func(*NetworkM
 	}
 
 	allowStream := maxPolls != 1
-	c.logf("PollNetMap: stream=%v :%v ep=%v", allowStream, localPort, ep)
+	c.logf("[v1] PollNetMap: stream=%v :%v ep=%v", allowStream, localPort, ep)
 
 	vlogf := logger.Discard
 	if Debug.NetMap {
+		// TODO(bradfitz): update this to use "[v2]" prefix perhaps? but we don't
+		// want to upload it always.
 		vlogf = c.logf
 	}
 
 	request := tailcfg.MapRequest{
-		Version:    5,
+		Version:    8,
 		KeepAlive:  c.keepAlive,
 		NodeKey:    tailcfg.NodeKey(persist.PrivateNodeKey.Public()),
 		DiscoKey:   c.discoPubKey,
@@ -631,6 +642,7 @@ func (c *Direct) PollNetMap(ctx context.Context, maxPolls int, cb func(*NetworkM
 
 	var lastDERPMap *tailcfg.DERPMap
 	var lastUserProfile = map[tailcfg.UserID]tailcfg.UserProfile{}
+	var lastParsedPacketFilter []filter.Match
 
 	// If allowStream, then the server will use an HTTP long poll to
 	// return incremental results. There is always one response right
@@ -671,7 +683,7 @@ func (c *Direct) PollNetMap(ctx context.Context, maxPolls int, cb func(*NetworkM
 		case timeoutReset <- struct{}{}:
 			vlogf("netmap: sent timer reset")
 		case <-ctx.Done():
-			c.logf("netmap: not resetting timer; context done: %v", ctx.Err())
+			c.logf("[v1] netmap: not resetting timer; context done: %v", ctx.Err())
 			return ctx.Err()
 		}
 		if resp.KeepAlive {
@@ -708,6 +720,10 @@ func (c *Direct) PollNetMap(ctx context.Context, maxPolls int, cb func(*NetworkM
 			resp.Peers = filtered
 		}
 
+		if pf := resp.PacketFilter; pf != nil {
+			lastParsedPacketFilter = c.parsePacketFilter(pf)
+		}
+
 		nm := &NetworkMap{
 			NodeKey:      tailcfg.NodeKey(persist.PrivateNodeKey.Public()),
 			PrivateKey:   persist.PrivateNodeKey,
@@ -722,7 +738,7 @@ func (c *Direct) PollNetMap(ctx context.Context, maxPolls int, cb func(*NetworkM
 			Domain:       resp.Domain,
 			DNS:          resp.DNSConfig,
 			Hostinfo:     resp.Node.Hostinfo,
-			PacketFilter: c.parsePacketFilter(resp.PacketFilter),
+			PacketFilter: lastParsedPacketFilter,
 			DERPMap:      lastDERPMap,
 			Debug:        resp.Debug,
 		}
@@ -762,7 +778,7 @@ func (c *Direct) PollNetMap(ctx context.Context, maxPolls int, cb func(*NetworkM
 		now := c.timeNow()
 		if now.Sub(c.lastPrintMap) >= 5*time.Minute {
 			c.lastPrintMap = now
-			c.logf("new network map[%d]:\n%s", i, nm.Concise())
+			c.logf("[v1] new network map[%d]:\n%s", i, nm.Concise())
 		}
 
 		c.mu.Lock()
@@ -790,6 +806,8 @@ func decode(res *http.Response, v interface{}, serverKey *wgcfg.Key, mkey *wgcfg
 }
 
 var debugMap, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_MAP"))
+
+var jsonEscapedZero = []byte(`\u0000`)
 
 func (c *Direct) decodeMsg(msg []byte, v interface{}) error {
 	c.mu.Lock()
@@ -819,6 +837,10 @@ func (c *Direct) decodeMsg(msg []byte, v interface{}) error {
 		json.Indent(&buf, b, "", "    ")
 		log.Printf("MapResponse: %s", buf.Bytes())
 	}
+
+	if bytes.Contains(b, jsonEscapedZero) {
+		log.Printf("[unexpected] zero byte in controlclient.Direct.decodeMsg into %T: %q", v, b)
+	}
 	if err := json.Unmarshal(b, v); err != nil {
 		return fmt.Errorf("response: %v", err)
 	}
@@ -830,6 +852,9 @@ func decodeMsg(msg []byte, v interface{}, serverKey *wgcfg.Key, mkey *wgcfg.Priv
 	decrypted, err := decryptMsg(msg, serverKey, mkey)
 	if err != nil {
 		return err
+	}
+	if bytes.Contains(decrypted, jsonEscapedZero) {
+		log.Printf("[unexpected] zero byte in controlclient decodeMsg into %T: %q", v, decrypted)
 	}
 	if err := json.Unmarshal(decrypted, v); err != nil {
 		return fmt.Errorf("response: %v", err)
@@ -1071,6 +1096,7 @@ func ipForwardingBroken(routes []wgcfg.CIDR) bool {
 		// Nothing to route, so no need to warn.
 		return false
 	}
+
 	if runtime.GOOS != "linux" {
 		// We only do subnet routing on Linux for now.
 		// It might work on darwin/macOS when building from source, so
@@ -1078,17 +1104,57 @@ func ipForwardingBroken(routes []wgcfg.CIDR) bool {
 		// already in the admin panel.
 		return false
 	}
-	out, err := ioutil.ReadFile("/proc/sys/net/ipv4/ip_forward")
-	if err != nil {
-		// Try another way.
-		out, err = exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
+
+	v4Routes, v6Routes := false, false
+	for _, r := range routes {
+		if r.IP.Is4() {
+			v4Routes = true
+		} else {
+			v6Routes = true
+		}
 	}
-	if err != nil {
-		// Oh well, we tried. This is just for debugging.
-		// We don't want false positives.
-		// TODO: maybe we want a different warning for inability to check?
-		return false
+
+	if v4Routes {
+		out, err := ioutil.ReadFile("/proc/sys/net/ipv4/ip_forward")
+		if err != nil {
+			// Try another way.
+			out, err = exec.Command("sysctl", "-n", "net.ipv4.ip_forward").Output()
+		}
+		if err != nil {
+			// Oh well, we tried. This is just for debugging.
+			// We don't want false positives.
+			// TODO: maybe we want a different warning for inability to check?
+			return false
+		}
+		if strings.TrimSpace(string(out)) == "0" {
+			return true
+		}
 	}
-	return strings.TrimSpace(string(out)) == "0"
-	// TODO: also check IPv6 if 'routes' contains any IPv6 routes
+	if v6Routes {
+		// Note: you might be wondering why we check only the state of
+		// conf.all.forwarding, rather than per-interface forwarding
+		// configuration. According to kernel documentation, it seems
+		// that to actually forward packets, you need to enable
+		// forwarding globally, and the per-interface forwarding
+		// setting only alters other things such as how router
+		// advertisements are handled. The kernel itself warns that
+		// enabling forwarding per-interface and not globally will
+		// probably not work, so I feel okay calling those configs
+		// broken until we have proof otherwise.
+		out, err := ioutil.ReadFile("/proc/sys/net/ipv6/conf/all/forwarding")
+		if err != nil {
+			out, err = exec.Command("sysctl", "-n", "net.ipv6.conf.all.forwarding").Output()
+		}
+		if err != nil {
+			// Oh well, we tried. This is just for debugging.
+			// We don't want false positives.
+			// TODO: maybe we want a different warning for inability to check?
+			return false
+		}
+		if strings.TrimSpace(string(out)) == "0" {
+			return true
+		}
+	}
+
+	return false
 }

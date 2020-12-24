@@ -56,7 +56,7 @@ func init() {
 // conditions in tests. In particular, you can't expect two test magicsocks
 // to be able to connect to each other through a test DERP unless they are
 // both fully initialized before you try.
-func (c *Conn) WaitReady(t *testing.T) {
+func (c *Conn) WaitReady(t testing.TB) {
 	t.Helper()
 	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
@@ -130,7 +130,7 @@ type magicStack struct {
 // newMagicStack builds and initializes an idle magicsock and
 // friends. You need to call conn.SetNetworkMap and dev.Reconfig
 // before anything interesting happens.
-func newMagicStack(t *testing.T, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap) *magicStack {
+func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap) *magicStack {
 	t.Helper()
 
 	privateKey, err := wgcfg.NewPrivateKey()
@@ -158,7 +158,7 @@ func newMagicStack(t *testing.T, logf logger.Logf, l nettype.PacketListener, der
 
 	tun := tuntest.NewChannelTUN()
 	tsTun := tstun.WrapTUN(logf, tun.TUN())
-	tsTun.SetFilter(filter.NewAllowAll([]filter.Net{filter.NetAny}, logf))
+	tsTun.SetFilter(filter.NewAllowAllForTest(logf))
 
 	dev := device.NewDevice(tsTun, &device.DeviceOptions{
 		Logger: &device.Logger{
@@ -377,7 +377,7 @@ collectEndpoints:
 	}
 }
 
-func pickPort(t *testing.T) uint16 {
+func pickPort(t testing.TB) uint16 {
 	t.Helper()
 	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -442,8 +442,8 @@ func TestPickDERPFallback(t *testing.T) {
 
 	// But move if peers are elsewhere.
 	const otherNode = 789
-	c.addrsByKey = map[key.Public]*AddrSet{
-		key.Public{1}: &AddrSet{addrs: []net.UDPAddr{{IP: derpMagicIP, Port: otherNode}}},
+	c.addrsByKey = map[key.Public]*addrSet{
+		key.Public{1}: &addrSet{addrs: []net.UDPAddr{{IP: derpMagicIP, Port: otherNode}}},
 	}
 	if got := c.pickDERPFallback(); got != otherNode {
 		t.Errorf("didn't join peers: got %v; want %v", got, someNode)
@@ -1075,7 +1075,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	})
 }
 
-// TestAddrSet tests AddrSet appendDests and UpdateDst.
+// TestAddrSet tests addrSet appendDests and UpdateDst.
 func TestAddrSet(t *testing.T) {
 	tstest.PanicOnLog()
 	rc := tstest.NewResourceCheck()
@@ -1134,13 +1134,13 @@ func TestAddrSet(t *testing.T) {
 	}
 	tests := []struct {
 		name     string
-		as       *AddrSet
+		as       *addrSet
 		steps    []step
 		logCheck func(t *testing.T, logged []byte)
 	}{
 		{
 			name: "reg_packet_no_curaddr",
-			as: &AddrSet{
+			as: &addrSet{
 				addrs:    udpAddrs("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
 				curAddr:  -1, // unknown
 				roamAddr: nil,
@@ -1151,7 +1151,7 @@ func TestAddrSet(t *testing.T) {
 		},
 		{
 			name: "reg_packet_have_curaddr",
-			as: &AddrSet{
+			as: &addrSet{
 				addrs:    udpAddrs("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
 				curAddr:  1, // global IP
 				roamAddr: nil,
@@ -1162,7 +1162,7 @@ func TestAddrSet(t *testing.T) {
 		},
 		{
 			name: "reg_packet_have_roamaddr",
-			as: &AddrSet{
+			as: &addrSet{
 				addrs:    udpAddrs("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
 				curAddr:  2, // should be ignored
 				roamAddr: mustIPPortPtr("5.6.7.8:123"),
@@ -1175,7 +1175,7 @@ func TestAddrSet(t *testing.T) {
 		},
 		{
 			name: "start_roaming",
-			as: &AddrSet{
+			as: &addrSet{
 				addrs:   udpAddrs("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
 				curAddr: 2,
 			},
@@ -1191,7 +1191,7 @@ func TestAddrSet(t *testing.T) {
 		},
 		{
 			name: "spray_packet",
-			as: &AddrSet{
+			as: &addrSet{
 				addrs:    udpAddrs("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
 				curAddr:  2, // should be ignored
 				roamAddr: mustIPPortPtr("5.6.7.8:123"),
@@ -1207,7 +1207,7 @@ func TestAddrSet(t *testing.T) {
 		},
 		{
 			name: "low_pri",
-			as: &AddrSet{
+			as: &addrSet{
 				addrs:   udpAddrs("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
 				curAddr: 2,
 			},
@@ -1254,9 +1254,9 @@ func TestAddrSet(t *testing.T) {
 	}
 }
 
-// initAddrSet initializes fields in the provided incomplete AddrSet
+// initAddrSet initializes fields in the provided incomplete addrSet
 // to satisfying invariants within magicsock.
-func initAddrSet(as *AddrSet) {
+func initAddrSet(as *addrSet) {
 	if as.roamAddr != nil && as.roamAddrStd == nil {
 		as.roamAddrStd = as.roamAddr.UDPAddr()
 	}
@@ -1342,5 +1342,77 @@ func TestDiscoEndpointAlignment(t *testing.T) {
 	}
 	if de.isFirstRecvActivityInAwhile() {
 		t.Error("expected false on second call")
+	}
+}
+
+func BenchmarkReceiveFrom(b *testing.B) {
+	port := pickPort(b)
+	conn, err := NewConn(Options{
+		Logf: b.Logf,
+		Port: port,
+		EndpointsFunc: func(eps []string) {
+			b.Logf("endpoints: %q", eps)
+		},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sendConn.Close()
+
+	var dstAddr net.Addr = conn.pconn4.LocalAddr()
+	sendBuf := make([]byte, 1<<10)
+	for i := range sendBuf {
+		sendBuf[i] = 'x'
+	}
+
+	buf := make([]byte, 2<<10)
+	for i := 0; i < b.N; i++ {
+		if _, err := sendConn.WriteTo(sendBuf, dstAddr); err != nil {
+			b.Fatalf("WriteTo: %v", err)
+		}
+		n, ep, addr, err := conn.ReceiveIPv4(buf)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = n
+		_ = ep
+		_ = addr
+	}
+}
+
+func BenchmarkReceiveFrom_Native(b *testing.B) {
+	recvConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer recvConn.Close()
+	recvConnUDP := recvConn.(*net.UDPConn)
+
+	sendConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sendConn.Close()
+
+	var dstAddr net.Addr = recvConn.LocalAddr()
+	sendBuf := make([]byte, 1<<10)
+	for i := range sendBuf {
+		sendBuf[i] = 'x'
+	}
+
+	buf := make([]byte, 2<<10)
+	for i := 0; i < b.N; i++ {
+		if _, err := sendConn.WriteTo(sendBuf, dstAddr); err != nil {
+			b.Fatalf("WriteTo: %v", err)
+		}
+		if _, _, err := recvConnUDP.ReadFromUDP(buf); err != nil {
+			b.Fatalf("ReadFromUDP: %v", err)
+		}
 	}
 }
