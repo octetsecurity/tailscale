@@ -13,21 +13,21 @@ import (
 )
 
 type Host struct {
-	Node *tailcfg.Node
-	DERPMap *tailcfg.DERPMap
-	Peers []*tailcfg.NodeID
+	Node         *tailcfg.Node
+	DERPMap      *tailcfg.DERPMap
+	Peers        []*tailcfg.NodeID
 	PeersChanged []*tailcfg.NodeID
 	PeersRemoved []tailcfg.NodeID
 }
 
 type ControlServer struct {
 	privateKey key.Private
-	publicKey key.Public
-	logf logger.Logf
-	metaCert    []byte // the encoded x509 cert to send after LetsEncrypt cert+intermediate
-	groups map[tailcfg.GroupID]*tailcfg.Group
-	users map[tailcfg.UserID]*tailcfg.User
-	hosts map[tailcfg.NodeID]*Host
+	publicKey  key.Public
+	logf       logger.Logf
+	metaCert   []byte // the encoded x509 cert to send after LetsEncrypt cert+intermediate
+	groups     map[tailcfg.GroupID]*tailcfg.Group
+	users      map[tailcfg.UserID]*tailcfg.User
+	hosts      map[tailcfg.NodeID]*Host
 }
 
 var matchLoginRequest = regexp.MustCompile(`machine/`)
@@ -57,7 +57,7 @@ func decode(req *http.Request, v interface{}, clientKey *wgcfg.Key, mkey *key.Pr
 	return nil
 }
 
-func Router(s *ControlServer) http.Handler{
+func Router(s *ControlServer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case matchLoginRequest.MatchString(r.URL.Path):
@@ -90,6 +90,10 @@ func matchClientKey(reg *regexp.Regexp, url string) (wgcfg.Key, error) {
 }
 
 func loginHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		io.WriteString(w, "Method not allowed")
+		return
+	}
 	reg := regexp.MustCompile(`machine/(.*)`)
 	clientKey, err := matchClientKey(reg, r.URL.Path)
 	if err != nil {
@@ -116,10 +120,13 @@ func loginHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write(resBody)
-
 }
 
 func pollNetMapHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		io.WriteString(w, "Method not allowed")
+		return
+	}
 	reg := regexp.MustCompile(`machine/(.*)/map`)
 	clientKey, err := matchClientKey(reg, r.URL.Path)
 	if err != nil {
