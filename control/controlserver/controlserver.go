@@ -1,22 +1,28 @@
 package controlserver
 
 import (
+	"encoding/binary"
 	"errors"
 	"github.com/tailscale/wireguard-go/wgcfg"
 	"io"
+	"math"
 	"net/http"
 	"regexp"
 	"runtime"
+	"strconv"
+	"tailscale.com/derp/derpmap"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"time"
+	"github.com/google/uuid"
 )
 
 type Host struct {
 	Node         *tailcfg.Node
 	DERPMap      *tailcfg.DERPMap
-	Peers        []*tailcfg.NodeID
-	PeersChanged []*tailcfg.NodeID
+	Peers        []tailcfg.NodeID
+	PeersChanged []tailcfg.NodeID
 	PeersRemoved []tailcfg.NodeID
 }
 
@@ -28,6 +34,7 @@ type ControlServer struct {
 	groups     map[tailcfg.GroupID]*tailcfg.Group
 	users      map[tailcfg.UserID]*tailcfg.User
 	hosts      map[tailcfg.NodeID]*Host
+	knownHost  map[tailcfg.MachineKey]tailcfg.NodeID
 }
 
 var matchLoginRequest = regexp.MustCompile(`machine/`)
@@ -79,7 +86,7 @@ func Router(s *ControlServer) http.Handler {
 	})
 }
 
-func matchClientKey(reg *regexp.Regexp, url string) (wgcfg.Key, error) {
+func matchClientMachineKey(reg *regexp.Regexp, url string) (wgcfg.Key, error) {
 	var err error
 	match := reg.FindStringSubmatch(url)
 	if len(match) <= 1 {
@@ -95,12 +102,12 @@ func loginHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reg := regexp.MustCompile(`machine/(.*)`)
-	clientKey, err := matchClientKey(reg, r.URL.Path)
+	clientMachineKey, err := matchClientMachineKey(reg, r.URL.Path)
 	if err != nil {
 		panic("Parse ClientKey Failure.")
 	}
 	request := tailcfg.RegisterRequest{}
-	if err := decode(r, &request, &clientKey, &s.privateKey); err != nil {
+	if err := decode(r, &request, &clientMachineKey, &s.privateKey); err != nil {
 		panic("Decode login request failure")
 	}
 
@@ -114,12 +121,42 @@ func loginHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
 		AuthURL:           "",
 	}
 
-	resBody, err := encode(res, &clientKey, &s.privateKey)
+	resBody, err := encode(res, &clientMachineKey, &s.privateKey)
 	if err != nil {
 		panic("Encode login response failure.")
 	}
 
 	w.Write(resBody)
+}
+
+func idGenerator() (int64) {
+	u := uuid.New().ID()
+	return int64(u)
+}
+
+func (s *ControlServer) addNewHost(node *tailcfg.Node, derpMap *tailcfg.DERPMap,
+	knownHost map[tailcfg.MachineKey]tailcfg.NodeID, machineKey tailcfg.MachineKey) (Host) {
+	knownHostCopy := knownHost
+	delete(knownHostCopy, node.Machine)
+
+	knownNodeId := make([]tailcfg.NodeID, 0, len(knownHostCopy))
+
+	for _, v := range knownHostCopy {
+		knownNodeId = append(knownNodeId, v)
+	}
+
+	host := Host{
+		Node:         node,
+		DERPMap:      derpMap,
+		Peers:        knownNodeId,
+		PeersChanged: nil,
+		PeersRemoved: nil,
+	}
+
+	s.knownHost[machineKey] = node.ID
+	s.hosts[node.ID] = &host
+
+	return host
 }
 
 func pollNetMapHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
@@ -128,20 +165,19 @@ func pollNetMapHandler(s *ControlServer, w http.ResponseWriter, r *http.Request)
 		return
 	}
 	reg := regexp.MustCompile(`machine/(.*)/map`)
-	clientKey, err := matchClientKey(reg, r.URL.Path)
+	clientMachineKey, err := matchClientMachineKey(reg, r.URL.Path)
 	if err != nil {
 		panic("Parse ClientKey Failure.")
 	}
 
 	pollRequest := tailcfg.MapRequest{}
-	if err := decode(r, &pollRequest, &clientKey, &s.privateKey); err != nil {
+	if err := decode(r, &pollRequest, &clientMachineKey, &s.privateKey); err != nil {
 		panic("Decode pollNetMap request failure")
 	}
 
 	// TODO: implement real logic
-
-	res := tailcfg.MapResponse{
-		KeepAlive:    false,
+	resp := tailcfg.MapResponse{
+		KeepAlive:    pollRequest.KeepAlive,
 		Node:         nil,
 		DERPMap:      nil,
 		Peers:        nil,
@@ -157,7 +193,41 @@ func pollNetMapHandler(s *ControlServer, w http.ResponseWriter, r *http.Request)
 		Debug:        nil,
 	}
 
-	resBody, err := encode(res, &clientKey, &s.privateKey)
+	if _, ok := s.knownHost[tailcfg.MachineKey(clientMachineKey)]; ok {
+
+	} else {
+		nodeId := tailcfg.NodeID(idGenerator())
+		node := tailcfg.Node{
+			ID:                nodeId,
+			Name:              "",
+			User:              0,
+			Key:               pollRequest.NodeKey,
+			KeyExpiry:         time.Now().Add(time.Hour * 8760),
+			Machine:           tailcfg.MachineKey(clientMachineKey),
+			DiscoKey:          pollRequest.DiscoKey,
+			Addresses:		   pollRequest.Hostinfo.RoutableIPs, // TODO: need to put wireguard IP here, I guess it's the first item in allowedIps
+			AllowedIPs:        pollRequest.Hostinfo.RoutableIPs,
+			Endpoints:         pollRequest.Endpoints,
+			DERP: strconv.Itoa(pollRequest.Hostinfo.NetInfo.PreferredDERP),
+			Hostinfo:          *pollRequest.Hostinfo,
+			Created:           time.Now(),
+			LastSeen:          nil,
+			KeepAlive:         pollRequest.KeepAlive,
+			MachineAuthorized: true,
+		}
+		resp.Node = &node
+		resp.DERPMap = derpmap.Prod()
+		host := s.addNewHost(&node, derpmap.Prod(), s.knownHost, tailcfg.MachineKey(clientMachineKey))
+		peers := []*tailcfg.Node{}
+		for _, nodeId := range host.Peers {
+			peers = append(peers, s.hosts[nodeId].Node)
+		}
+
+		resp.Peers = peers
+
+	}
+
+	resBody, err := encode(resp, &clientMachineKey, &s.privateKey)
 	if err != nil {
 		panic("Encode login response failure.")
 	}
