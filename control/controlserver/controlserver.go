@@ -1,11 +1,10 @@
 package controlserver
 
 import (
-	"encoding/binary"
 	"errors"
+	"github.com/google/uuid"
 	"github.com/tailscale/wireguard-go/wgcfg"
 	"io"
-	"math"
 	"net/http"
 	"regexp"
 	"runtime"
@@ -15,7 +14,6 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"time"
-	"github.com/google/uuid"
 )
 
 type Host struct {
