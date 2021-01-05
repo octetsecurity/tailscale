@@ -11,8 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tailscale/wireguard-go/tun"
-	wgregistry "github.com/tailscale/wireguard-go/tun/wintun/registry"
 	"golang.org/x/sys/windows/registry"
 	"tailscale.com/types/logger"
 )
@@ -31,7 +29,7 @@ type windowsManager struct {
 func newManager(mconfig ManagerConfig) managerImpl {
 	return windowsManager{
 		logf: mconfig.Logf,
-		guid: tun.WintunGUID,
+		guid: mconfig.InterfaceName,
 	}
 }
 
@@ -39,10 +37,10 @@ func newManager(mconfig ManagerConfig) managerImpl {
 // appear. For some reason, registry keys tied to ephemeral interfaces
 // can take a long while to appear after interface creation, and we
 // can end up racing with that.
-const keyOpenTimeout = time.Minute
+const keyOpenTimeout = 20 * time.Second
 
 func setRegistryString(path, name, value string) error {
-	key, err := wgregistry.OpenKeyWait(registry.LOCAL_MACHINE, path, registry.SET_VALUE, keyOpenTimeout)
+	key, err := openKeyWait(registry.LOCAL_MACHINE, path, registry.SET_VALUE, keyOpenTimeout)
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", path, err)
 	}

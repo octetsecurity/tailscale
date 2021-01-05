@@ -29,6 +29,7 @@ import (
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/systemd"
 	"tailscale.com/version"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
@@ -208,8 +209,14 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 				lastSeen = *p.LastSeen
 			}
 			var tailAddr string
-			if len(p.Addresses) > 0 {
-				tailAddr = strings.TrimSuffix(p.Addresses[0].String(), "/32")
+			for _, addr := range p.Addresses {
+				// The peer struct currently only allows a single
+				// Tailscale IP address. For compatibility with the
+				// old display, make sure it's the IPv4 address.
+				if addr.IP.Is4() && addr.Mask == 32 && tsaddr.IsTailscaleIP(netaddr.IPFrom16(addr.IP.Addr)) {
+					tailAddr = addr.IP.String()
+					break
+				}
 			}
 			sb.AddPeer(key.Public(p.Key), &ipnstate.PeerStatus{
 				InNetworkMap: true,
@@ -221,6 +228,7 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 				KeepAlive:    p.KeepAlive,
 				Created:      p.Created,
 				LastSeen:     lastSeen,
+				ShareeNode:   p.Hostinfo.ShareeNode,
 			})
 		}
 	}
@@ -243,7 +251,11 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 	// The following do not depend on any data for which we need to lock b.
 	if st.Err != "" {
 		// TODO(crawshaw): display in the UI.
-		b.logf("Received error: %v", st.Err)
+		if st.Err == "EOF" {
+			b.logf("[v1] Received error: EOF")
+		} else {
+			b.logf("Received error: %v", st.Err)
+		}
 		return
 	}
 	if st.LoginFinished != nil {
@@ -307,7 +319,7 @@ func (b *LocalBackend) setClientStatus(st controlclient.Status) {
 		if netMap != nil {
 			diff := st.NetMap.ConciseDiffFrom(netMap)
 			if strings.TrimSpace(diff) == "" {
-				b.logf("netmap diff: (none)")
+				b.logf("[v1] netmap diff: (none)")
 			} else {
 				b.logf("netmap diff:\n%v", diff)
 			}
@@ -523,7 +535,7 @@ func (b *LocalBackend) updateFilter(netMap *controlclient.NetworkMap, prefs *Pre
 	var (
 		haveNetmap   = netMap != nil
 		addrs        []wgcfg.CIDR
-		packetFilter filter.Matches
+		packetFilter []filter.Match
 		advRoutes    []wgcfg.CIDR
 		shieldsUp    = prefs == nil || prefs.ShieldsUp // Be conservative when not ready
 	)
@@ -546,12 +558,12 @@ func (b *LocalBackend) updateFilter(netMap *controlclient.NetworkMap, prefs *Pre
 		return
 	}
 
-	localNets := wgCIDRsToFilter(netMap.Addresses, advRoutes)
+	localNets := wgCIDRsToNetaddr(netMap.Addresses, advRoutes)
 
 	if shieldsUp {
 		b.logf("netmap packet filter: (shields up)")
 		var prevFilter *filter.Filter // don't reuse old filter state
-		b.e.SetFilter(filter.New(filter.Matches{}, localNets, prevFilter, b.logf))
+		b.e.SetFilter(filter.New(nil, localNets, prevFilter, b.logf))
 	} else {
 		b.logf("netmap packet filter: %v", packetFilter)
 		b.e.SetFilter(filter.New(packetFilter, localNets, b.e.GetFilter(), b.logf))
@@ -995,8 +1007,8 @@ func (b *LocalBackend) parseWgStatusLocked(s *wgengine.Status) (ret EngineStatus
 
 	// [GRINDER STATS LINES] - please don't remove (used for log parsing)
 	if peerStats.Len() > 0 {
-		b.keyLogf("peer keys: %s", strings.TrimSpace(peerKeys.String()))
-		b.statsLogf("v%v peers: %v", version.Long, strings.TrimSpace(peerStats.String()))
+		b.keyLogf("[v1] peer keys: %s", strings.TrimSpace(peerKeys.String()))
+		b.statsLogf("[v1] v%v peers: %v", version.Long, strings.TrimSpace(peerStats.String()))
 	}
 	return ret
 }
@@ -1154,6 +1166,7 @@ func (b *LocalBackend) authReconfig() {
 	uc := b.prefs
 	nm := b.netMap
 	hasPAC := b.prevIfState.HasPAC()
+	disableSubnetsIfPAC := nm != nil && nm.Debug != nil && nm.Debug.DisableSubnetsIfPAC.EqualBool(true)
 	b.mu.Unlock()
 
 	if blocked {
@@ -1178,13 +1191,7 @@ func (b *LocalBackend) authReconfig() {
 	if uc.AllowSingleHosts {
 		flags |= controlclient.AllowSingleHosts
 	}
-	if hasPAC {
-		// TODO(bradfitz): make this policy configurable per
-		// domain, flesh out all the edge cases where subnet
-		// routes might shadow corp HTTP proxies, DNS servers,
-		// domain controllers, etc. For now we just want
-		// Tailscale to stay enabled while laptops roam
-		// between corp & non-corp networks.
+	if hasPAC && disableSubnetsIfPAC {
 		if flags&controlclient.AllowSubnetRoutes != 0 {
 			b.logf("authReconfig: have PAC; disabling subnet routes")
 			flags &^= controlclient.AllowSubnetRoutes
@@ -1224,7 +1231,7 @@ func (b *LocalBackend) authReconfig() {
 	if err == wgengine.ErrNoChanges {
 		return
 	}
-	b.logf("authReconfig: ra=%v dns=%v 0x%02x: %v", uc.RouteAll, uc.CorpDNS, flags, err)
+	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", uc.RouteAll, uc.CorpDNS, flags, err)
 }
 
 // domainsForProxying produces a list of search domains for proxied DNS.
@@ -1261,19 +1268,19 @@ func routerConfig(cfg *wgcfg.Config, prefs *Prefs) *router.Config {
 	for _, addr := range cfg.Addresses {
 		addrs = append(addrs, wgcfg.CIDR{
 			IP:   addr.IP,
-			Mask: 32,
+			Mask: addr.Mask,
 		})
 	}
 
 	rs := &router.Config{
-		LocalAddrs:       wgCIDRToNetaddr(addrs),
-		SubnetRoutes:     wgCIDRToNetaddr(prefs.AdvertiseRoutes),
+		LocalAddrs:       wgCIDRsToNetaddr(addrs),
+		SubnetRoutes:     wgCIDRsToNetaddr(prefs.AdvertiseRoutes),
 		SNATSubnetRoutes: !prefs.NoSNAT,
 		NetfilterMode:    prefs.NetfilterMode,
 	}
 
 	for _, peer := range cfg.Peers {
-		rs.Routes = append(rs.Routes, wgCIDRToNetaddr(peer.AllowedIPs)...)
+		rs.Routes = append(rs.Routes, wgCIDRsToNetaddr(peer.AllowedIPs)...)
 	}
 
 	rs.Routes = append(rs.Routes, netaddr.IPPrefix{
@@ -1284,31 +1291,16 @@ func routerConfig(cfg *wgcfg.Config, prefs *Prefs) *router.Config {
 	return rs
 }
 
-// wgCIDRsToFilter converts lists of wgcfg.CIDR into a single list of
-// filter.Net.
-func wgCIDRsToFilter(cidrLists ...[]wgcfg.CIDR) (ret []filter.Net) {
+func wgCIDRsToNetaddr(cidrLists ...[]wgcfg.CIDR) (ret []netaddr.IPPrefix) {
 	for _, cidrs := range cidrLists {
 		for _, cidr := range cidrs {
-			if !cidr.IP.Is4() {
-				continue
+			ncidr, ok := netaddr.FromStdIPNet(cidr.IPNet())
+			if !ok {
+				panic(fmt.Sprintf("conversion of %s from wgcfg to netaddr IPNet failed", cidr))
 			}
-			ret = append(ret, filter.Net{
-				IP:   filter.NewIP(cidr.IP.IP()),
-				Mask: filter.Netmask(int(cidr.Mask)),
-			})
+			ncidr.IP = ncidr.IP.Unmap()
+			ret = append(ret, ncidr)
 		}
-	}
-	return ret
-}
-
-func wgCIDRToNetaddr(cidrs []wgcfg.CIDR) (ret []netaddr.IPPrefix) {
-	for _, cidr := range cidrs {
-		ncidr, ok := netaddr.FromStdIPNet(cidr.IPNet())
-		if !ok {
-			panic(fmt.Sprintf("conversion of %s from wgcfg to netaddr IPNet failed", cidr))
-		}
-		ncidr.IP = ncidr.IP.Unmap()
-		ret = append(ret, ncidr)
 	}
 	return ret
 }
@@ -1323,6 +1315,7 @@ func applyPrefsToHostinfo(hi *tailcfg.Hostinfo, prefs *Prefs) {
 	if m := prefs.DeviceModel; m != "" {
 		hi.DeviceModel = m
 	}
+	hi.ShieldsUp = prefs.ShieldsUp
 }
 
 // enterState transitions the backend into newState, updating internal
@@ -1340,6 +1333,8 @@ func (b *LocalBackend) enterState(newState State) {
 	notify := b.notify
 	bc := b.c
 	networkUp := b.prevIfState.AnyInterfaceUp()
+	activeLogin := b.activeLogin
+	authURL := b.authURL
 	b.mu.Unlock()
 
 	if state == newState {
@@ -1357,6 +1352,7 @@ func (b *LocalBackend) enterState(newState State) {
 
 	switch newState {
 	case NeedsLogin:
+		systemd.Status("Needs login: %s", authURL)
 		b.blockEngineUpdates(true)
 		fallthrough
 	case Stopped:
@@ -1364,12 +1360,20 @@ func (b *LocalBackend) enterState(newState State) {
 		if err != nil {
 			b.logf("Reconfig(down): %v", err)
 		}
+
+		if authURL == "" {
+			systemd.Status("Stopped; run 'tailscale up' to log in")
+		}
 	case Starting, NeedsMachineAuth:
 		b.authReconfig()
 		// Needed so that UpdateEndpoints can run
 		b.e.RequestStatus()
 	case Running:
-		break
+		var addrs []string
+		for _, addr := range b.netMap.Addresses {
+			addrs = append(addrs, addr.IP.String())
+		}
+		systemd.Status("Connected; %s; %s", activeLogin, strings.Join(addrs, " "))
 	default:
 		b.logf("[unexpected] unknown newState %#v", newState)
 	}
@@ -1568,8 +1572,8 @@ func (b *LocalBackend) TestOnlyPublicKeys() (machineKey tailcfg.MachineKey, node
 // 1.0.x.  But eventually we want to stop sending the machine key to
 // clients. We can't do that until 1.0.x is no longer supported.
 func temporarilySetMachineKeyInPersist() bool {
-	//lint:ignore S1008 for comments
-	if runtime.GOOS == "darwin" || runtime.GOOS == "android" {
+	switch runtime.GOOS {
+	case "darwin", "ios", "android":
 		// iOS, macOS, Android users can't downgrade anyway.
 		return false
 	}

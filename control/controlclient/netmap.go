@@ -34,7 +34,7 @@ type NetworkMap struct {
 	Peers         []*tailcfg.Node // sorted by Node.ID
 	DNS           tailcfg.DNSConfig
 	Hostinfo      tailcfg.Hostinfo
-	PacketFilter  filter.Matches
+	PacketFilter  []filter.Match
 
 	// DERPMap is the last DERP server map received. It's reused
 	// between updates and should not be modified.
@@ -280,12 +280,12 @@ func (nm *NetworkMap) WGCfg(logf logger.Logf, flags WGConfigFlags) (*wgcfg.Confi
 		for _, allowedIP := range peer.AllowedIPs {
 			if allowedIP.Mask == 0 {
 				if (flags & AllowDefaultRoute) == 0 {
-					logf("wgcfg: %v skipping default route", peer.Key.ShortString())
+					logf("[v1] wgcfg: %v skipping default route", peer.Key.ShortString())
 					continue
 				}
 			} else if cidrIsSubnet(peer, allowedIP) {
 				if (flags & AllowSubnetRoutes) == 0 {
-					logf("wgcfg: %v skipping subnet route", peer.Key.ShortString())
+					logf("[v1] wgcfg: %v skipping subnet route", peer.Key.ShortString())
 					continue
 				}
 			}

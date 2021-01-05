@@ -7,8 +7,10 @@ package packet
 import (
 	"encoding/binary"
 	"fmt"
+	"net"
 	"strings"
 
+	"inet.af/netaddr"
 	"tailscale.com/types/strbuilder"
 )
 
@@ -21,18 +23,8 @@ const (
 	TCPSynAck = TCPSyn | TCPAck
 )
 
-var (
-	get16 = binary.BigEndian.Uint16
-	get32 = binary.BigEndian.Uint32
-
-	put16 = binary.BigEndian.PutUint16
-	put32 = binary.BigEndian.PutUint32
-)
-
-// ParsedPacket is a minimal decoding of a packet suitable for use in filters.
-//
-// In general, it only supports IPv4. The IPv6 parsing is very minimal.
-type ParsedPacket struct {
+// Parsed is a minimal decoding of a packet suitable for use in filters.
+type Parsed struct {
 	// b is the byte buffer that this decodes.
 	b []byte
 	// subofs is the offset of IP subprotocol.
@@ -43,96 +35,92 @@ type ParsedPacket struct {
 	// This is not the same as len(b) because b can have trailing zeros.
 	length int
 
-	IPVersion uint8    // 4, 6, or 0
-	IPProto   IP4Proto // IP subprotocol (UDP, TCP, etc); the NextHeader field for IPv6
-	SrcIP     IP4      // IP source address (not used for IPv6)
-	DstIP     IP4      // IP destination address (not used for IPv6)
-	SrcPort   uint16   // TCP/UDP source port
-	DstPort   uint16   // TCP/UDP destination port
-	TCPFlags  uint8    // TCP flags (SYN, ACK, etc)
+	// IPVersion is the IP protocol version of the packet (4 or
+	// 6), or 0 if the packet doesn't look like IPv4 or IPv6.
+	IPVersion uint8
+	// IPProto is the IP subprotocol (UDP, TCP, etc.). Valid iff IPVersion != 0.
+	IPProto IPProto
+	// SrcIP4 is the source address. Family matches IPVersion. Port is
+	// valid iff IPProto == TCP || IPProto == UDP.
+	Src netaddr.IPPort
+	// DstIP4 is the destination address. Family matches IPVersion.
+	Dst netaddr.IPPort
+	// TCPFlags is the packet's TCP flag bigs. Valid iff IPProto == TCP.
+	TCPFlags uint8
 }
 
-// NextHeader
-type NextHeader uint8
-
-func (p *ParsedPacket) String() string {
-	if p.IPVersion == 6 {
-		return fmt.Sprintf("IPv6{Proto=%d}", p.IPProto)
-	}
-	switch p.IPProto {
-	case Unknown:
+func (p *Parsed) String() string {
+	if p.IPVersion != 4 && p.IPVersion != 6 {
 		return "Unknown{???}"
 	}
+
 	sb := strbuilder.Get()
 	sb.WriteString(p.IPProto.String())
 	sb.WriteByte('{')
-	writeIPPort(sb, p.SrcIP, p.SrcPort)
+	writeIPPort(sb, p.Src)
 	sb.WriteString(" > ")
-	writeIPPort(sb, p.DstIP, p.DstPort)
+	writeIPPort(sb, p.Dst)
 	sb.WriteByte('}')
 	return sb.String()
 }
 
-func writeIPPort(sb *strbuilder.Builder, ip IP4, port uint16) {
-	sb.WriteUint(uint64(byte(ip >> 24)))
-	sb.WriteByte('.')
-	sb.WriteUint(uint64(byte(ip >> 16)))
-	sb.WriteByte('.')
-	sb.WriteUint(uint64(byte(ip >> 8)))
-	sb.WriteByte('.')
-	sb.WriteUint(uint64(byte(ip)))
-	sb.WriteByte(':')
-	sb.WriteUint(uint64(port))
-}
-
-// based on https://tools.ietf.org/html/rfc1071
-func ipChecksum(b []byte) uint16 {
-	var ac uint32
-	i := 0
-	n := len(b)
-	for n >= 2 {
-		ac += uint32(get16(b[i : i+2]))
-		n -= 2
-		i += 2
+// writeIPPort writes ipp.String() into sb, with fewer allocations.
+//
+// TODO: make netaddr more efficient in this area, and retire this func.
+func writeIPPort(sb *strbuilder.Builder, ipp netaddr.IPPort) {
+	if ipp.IP.Is4() {
+		raw := ipp.IP.As4()
+		sb.WriteUint(uint64(raw[0]))
+		sb.WriteByte('.')
+		sb.WriteUint(uint64(raw[1]))
+		sb.WriteByte('.')
+		sb.WriteUint(uint64(raw[2]))
+		sb.WriteByte('.')
+		sb.WriteUint(uint64(raw[3]))
+		sb.WriteByte(':')
+	} else {
+		sb.WriteByte('[')
+		sb.WriteString(ipp.IP.String()) // TODO: faster?
+		sb.WriteString("]:")
 	}
-	if n == 1 {
-		ac += uint32(b[i]) << 8
-	}
-	for (ac >> 16) > 0 {
-		ac = (ac >> 16) + (ac & 0xffff)
-	}
-	return uint16(^ac)
+	sb.WriteUint(uint64(ipp.Port))
 }
 
 // Decode extracts data from the packet in b into q.
 // It performs extremely simple packet decoding for basic IPv4 packet types.
 // It extracts only the subprotocol id, IP addresses, and (if any) ports,
 // and shouldn't need any memory allocation.
-func (q *ParsedPacket) Decode(b []byte) {
+func (q *Parsed) Decode(b []byte) {
 	q.b = b
 
-	if len(b) < ipHeaderLength {
+	if len(b) < 1 {
+		q.IPVersion = 0
+		q.IPProto = Unknown
+		return
+	}
+
+	q.IPVersion = b[0] >> 4
+	switch q.IPVersion {
+	case 4:
+		q.decode4(b)
+	case 6:
+		q.decode6(b)
+	default:
+		q.IPVersion = 0
+		q.IPProto = Unknown
+	}
+}
+
+func (q *Parsed) decode4(b []byte) {
+	if len(b) < ip4HeaderLength {
 		q.IPVersion = 0
 		q.IPProto = Unknown
 		return
 	}
 
 	// Check that it's IPv4.
-	// TODO(apenwarr): consider IPv6 support
-	q.IPVersion = (b[0] & 0xF0) >> 4
-	switch q.IPVersion {
-	case 4:
-		q.IPProto = IP4Proto(b[9])
-	case 6:
-		q.IPProto = IP4Proto(b[6]) // "Next Header" field
-		return
-	default:
-		q.IPVersion = 0
-		q.IPProto = Unknown
-		return
-	}
-
-	q.length = int(get16(b[2:4]))
+	q.IPProto = IPProto(b[9])
+	q.length = int(binary.BigEndian.Uint16(b[2:4]))
 	if len(b) < q.length {
 		// Packet was cut off before full IPv4 length.
 		q.IPProto = Unknown
@@ -140,11 +128,17 @@ func (q *ParsedPacket) Decode(b []byte) {
 	}
 
 	// If it's valid IPv4, then the IP addresses are valid
-	q.SrcIP = IP4(get32(b[12:16]))
-	q.DstIP = IP4(get32(b[16:20]))
+	q.Src.IP = netaddr.IPv4(b[12], b[13], b[14], b[15])
+	q.Dst.IP = netaddr.IPv4(b[16], b[17], b[18], b[19])
 
 	q.subofs = int((b[0] & 0x0F) << 2)
+	if q.subofs > q.length {
+		// next-proto starts beyond end of packet.
+		q.IPProto = Unknown
+		return
+	}
 	sub := b[q.subofs:]
+	sub = sub[:len(sub):len(sub)] // help the compiler do bounds check elimination
 
 	// We don't care much about IP fragmentation, except insofar as it's
 	// used for firewall bypass attacks. The trick is make the first
@@ -158,7 +152,7 @@ func (q *ParsedPacket) Decode(b []byte) {
 	// zero reason to send such a short first fragment, so we can treat
 	// it as Unknown. We can also treat any subsequent fragment that starts
 	// at such a low offset as Unknown.
-	fragFlags := get16(b[6:8])
+	fragFlags := binary.BigEndian.Uint16(b[6:8])
 	moreFrags := (fragFlags & 0x20) != 0
 	fragOfs := fragFlags & 0x1FFF
 	if fragOfs == 0 {
@@ -172,22 +166,26 @@ func (q *ParsedPacket) Decode(b []byte) {
 		// or a big enough initial fragment that we can read the
 		// whole subprotocol header.
 		switch q.IPProto {
-		case ICMP:
-			if len(sub) < icmpHeaderLength {
+		case ICMPv4:
+			if len(sub) < icmp4HeaderLength {
 				q.IPProto = Unknown
 				return
 			}
-			q.SrcPort = 0
-			q.DstPort = 0
-			q.dataofs = q.subofs + icmpHeaderLength
+			q.Src.Port = 0
+			q.Dst.Port = 0
+			q.dataofs = q.subofs + icmp4HeaderLength
+			return
+		case IGMP:
+			// Keep IPProto, but don't parse anything else
+			// out.
 			return
 		case TCP:
 			if len(sub) < tcpHeaderLength {
 				q.IPProto = Unknown
 				return
 			}
-			q.SrcPort = get16(sub[0:2])
-			q.DstPort = get16(sub[2:4])
+			q.Src.Port = binary.BigEndian.Uint16(sub[0:2])
+			q.Dst.Port = binary.BigEndian.Uint16(sub[2:4])
 			q.TCPFlags = sub[13] & 0x3F
 			headerLength := (sub[12] & 0xF0) >> 2
 			q.dataofs = q.subofs + int(headerLength)
@@ -197,8 +195,8 @@ func (q *ParsedPacket) Decode(b []byte) {
 				q.IPProto = Unknown
 				return
 			}
-			q.SrcPort = get16(sub[0:2])
-			q.DstPort = get16(sub[2:4])
+			q.Src.Port = binary.BigEndian.Uint16(sub[0:2])
+			q.Dst.Port = binary.BigEndian.Uint16(sub[2:4])
 			q.dataofs = q.subofs + udpHeaderLength
 			return
 		default:
@@ -224,90 +222,171 @@ func (q *ParsedPacket) Decode(b []byte) {
 	}
 }
 
-func (q *ParsedPacket) IPHeader() IP4Header {
-	ipid := get16(q.b[4:6])
-	return IP4Header{
-		IPID:    ipid,
-		IPProto: q.IPProto,
-		SrcIP:   q.SrcIP,
-		DstIP:   q.DstIP,
+func (q *Parsed) decode6(b []byte) {
+	if len(b) < ip6HeaderLength {
+		q.IPVersion = 0
+		q.IPProto = Unknown
+		return
+	}
+
+	q.IPProto = IPProto(b[6])
+	q.length = int(binary.BigEndian.Uint16(b[4:6])) + ip6HeaderLength
+	if len(b) < q.length {
+		// Packet was cut off before the full IPv6 length.
+		q.IPProto = Unknown
+		return
+	}
+
+	// okay to ignore `ok` here, because IPs pulled from packets are
+	// always well-formed stdlib IPs.
+	q.Src.IP, _ = netaddr.FromStdIP(net.IP(b[8:24]))
+	q.Dst.IP, _ = netaddr.FromStdIP(net.IP(b[24:40]))
+
+	// We don't support any IPv6 extension headers. Don't try to
+	// be clever. Therefore, the IP subprotocol always starts at
+	// byte 40.
+	//
+	// Note that this means we don't support fragmentation in
+	// IPv6. This is fine, because IPv6 strongly mandates that you
+	// should not fragment, which makes fragmentation on the open
+	// internet extremely uncommon.
+	//
+	// This also means we don't support IPSec headers (AH/ESP), or
+	// IPv6 jumbo frames. Those will get marked Unknown and
+	// dropped.
+	q.subofs = 40
+	sub := b[q.subofs:]
+	sub = sub[:len(sub):len(sub)] // help the compiler do bounds check elimination
+
+	switch q.IPProto {
+	case ICMPv6:
+		if len(sub) < icmp6HeaderLength {
+			q.IPProto = Unknown
+			return
+		}
+		q.Src.Port = 0
+		q.Dst.Port = 0
+		q.dataofs = q.subofs + icmp6HeaderLength
+	case TCP:
+		if len(sub) < tcpHeaderLength {
+			q.IPProto = Unknown
+			return
+		}
+		q.Src.Port = binary.BigEndian.Uint16(sub[0:2])
+		q.Dst.Port = binary.BigEndian.Uint16(sub[2:4])
+		q.TCPFlags = sub[13] & 0x3F
+		headerLength := (sub[12] & 0xF0) >> 2
+		q.dataofs = q.subofs + int(headerLength)
+		return
+	case UDP:
+		if len(sub) < udpHeaderLength {
+			q.IPProto = Unknown
+			return
+		}
+		q.Src.Port = binary.BigEndian.Uint16(sub[0:2])
+		q.Dst.Port = binary.BigEndian.Uint16(sub[2:4])
+		q.dataofs = q.subofs + udpHeaderLength
+	default:
+		q.IPProto = Unknown
+		return
 	}
 }
 
-func (q *ParsedPacket) ICMPHeader() ICMP4Header {
+func (q *Parsed) IP4Header() IP4Header {
+	if q.IPVersion != 4 {
+		panic("IP4Header called on non-IPv4 Parsed")
+	}
+	ipid := binary.BigEndian.Uint16(q.b[4:6])
+	return IP4Header{
+		IPID:    ipid,
+		IPProto: q.IPProto,
+		Src:     q.Src.IP,
+		Dst:     q.Dst.IP,
+	}
+}
+
+func (q *Parsed) ICMP4Header() ICMP4Header {
+	if q.IPVersion != 4 {
+		panic("IP4Header called on non-IPv4 Parsed")
+	}
 	return ICMP4Header{
-		IP4Header: q.IPHeader(),
+		IP4Header: q.IP4Header(),
 		Type:      ICMP4Type(q.b[q.subofs+0]),
 		Code:      ICMP4Code(q.b[q.subofs+1]),
 	}
 }
 
-func (q *ParsedPacket) UDPHeader() UDP4Header {
+func (q *Parsed) UDP4Header() UDP4Header {
+	if q.IPVersion != 4 {
+		panic("IP4Header called on non-IPv4 Parsed")
+	}
 	return UDP4Header{
-		IP4Header: q.IPHeader(),
-		SrcPort:   q.SrcPort,
-		DstPort:   q.DstPort,
+		IP4Header: q.IP4Header(),
+		SrcPort:   q.Src.Port,
+		DstPort:   q.Dst.Port,
 	}
 }
 
 // Buffer returns the entire packet buffer.
 // This is a read-only view; that is, q retains the ownership of the buffer.
-func (q *ParsedPacket) Buffer() []byte {
+func (q *Parsed) Buffer() []byte {
 	return q.b
-}
-
-// Sub returns the IP subprotocol section.
-// This is a read-only view; that is, q retains the ownership of the buffer.
-func (q *ParsedPacket) Sub(begin, n int) []byte {
-	return q.b[q.subofs+begin : q.subofs+begin+n]
 }
 
 // Payload returns the payload of the IP subprotocol section.
 // This is a read-only view; that is, q retains the ownership of the buffer.
-func (q *ParsedPacket) Payload() []byte {
+func (q *Parsed) Payload() []byte {
 	return q.b[q.dataofs:q.length]
-}
-
-// Trim trims the buffer to its IPv4 length.
-// Sometimes packets arrive from an interface with extra bytes on the end.
-// This removes them.
-func (q *ParsedPacket) Trim() []byte {
-	return q.b[:q.length]
 }
 
 // IsTCPSyn reports whether q is a TCP SYN packet
 // (i.e. the first packet in a new connection).
-func (q *ParsedPacket) IsTCPSyn() bool {
+func (q *Parsed) IsTCPSyn() bool {
 	return (q.TCPFlags & TCPSynAck) == TCPSyn
 }
 
-// IsError reports whether q is an IPv4 ICMP "Error" packet.
-func (q *ParsedPacket) IsError() bool {
-	if q.IPProto == ICMP && len(q.b) >= q.subofs+8 {
-		switch ICMP4Type(q.b[q.subofs]) {
-		case ICMP4Unreachable, ICMP4TimeExceeded:
-			return true
+// IsError reports whether q is an ICMP "Error" packet.
+func (q *Parsed) IsError() bool {
+	switch q.IPProto {
+	case ICMPv4:
+		if len(q.b) < q.subofs+8 {
+			return false
 		}
+		t := ICMP4Type(q.b[q.subofs])
+		return t == ICMP4Unreachable || t == ICMP4TimeExceeded
+	case ICMPv6:
+		if len(q.b) < q.subofs+8 {
+			return false
+		}
+		t := ICMP6Type(q.b[q.subofs])
+		return t == ICMP6Unreachable || t == ICMP6TimeExceeded
+	default:
+		return false
 	}
-	return false
 }
 
-// IsEchoRequest reports whether q is an IPv4 ICMP Echo Request.
-func (q *ParsedPacket) IsEchoRequest() bool {
-	if q.IPProto == ICMP && len(q.b) >= q.subofs+8 {
-		return ICMP4Type(q.b[q.subofs]) == ICMP4EchoRequest &&
-			ICMP4Code(q.b[q.subofs+1]) == ICMP4NoCode
+// IsEchoRequest reports whether q is an ICMP Echo Request.
+func (q *Parsed) IsEchoRequest() bool {
+	switch q.IPProto {
+	case ICMPv4:
+		return len(q.b) >= q.subofs+8 && ICMP4Type(q.b[q.subofs]) == ICMP4EchoRequest && ICMP4Code(q.b[q.subofs+1]) == ICMP4NoCode
+	case ICMPv6:
+		return len(q.b) >= q.subofs+8 && ICMP6Type(q.b[q.subofs]) == ICMP6EchoRequest && ICMP6Code(q.b[q.subofs+1]) == ICMP6NoCode
+	default:
+		return false
 	}
-	return false
 }
 
 // IsEchoRequest reports whether q is an IPv4 ICMP Echo Response.
-func (q *ParsedPacket) IsEchoResponse() bool {
-	if q.IPProto == ICMP && len(q.b) >= q.subofs+8 {
-		return ICMP4Type(q.b[q.subofs]) == ICMP4EchoReply &&
-			ICMP4Code(q.b[q.subofs+1]) == ICMP4NoCode
+func (q *Parsed) IsEchoResponse() bool {
+	switch q.IPProto {
+	case ICMPv4:
+		return len(q.b) >= q.subofs+8 && ICMP4Type(q.b[q.subofs]) == ICMP4EchoReply && ICMP4Code(q.b[q.subofs+1]) == ICMP4NoCode
+	case ICMPv6:
+		return len(q.b) >= q.subofs+8 && ICMP6Type(q.b[q.subofs]) == ICMP6EchoReply && ICMP6Code(q.b[q.subofs+1]) == ICMP6NoCode
+	default:
+		return false
 	}
-	return false
 }
 
 func Hexdump(b []byte) string {

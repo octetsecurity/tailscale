@@ -16,6 +16,7 @@ import (
 
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
+	"inet.af/netaddr"
 	"tailscale.com/net/packet"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/filter"
@@ -45,14 +46,14 @@ var (
 	errOffsetTooSmall = errors.New("offset smaller than PacketStartOffset")
 )
 
-// parsedPacketPool holds a pool of ParsedPacket structs for use in filtering.
+// parsedPacketPool holds a pool of Parsed structs for use in filtering.
 // This is needed because escape analysis cannot see that parsed packets
 // do not escape through {Pre,Post}Filter{In,Out}.
-var parsedPacketPool = sync.Pool{New: func() interface{} { return new(packet.ParsedPacket) }}
+var parsedPacketPool = sync.Pool{New: func() interface{} { return new(packet.Parsed) }}
 
 // FilterFunc is a packet-filtering function with access to the TUN device.
 // It must not hold onto the packet struct, as its backing storage will be reused.
-type FilterFunc func(*packet.ParsedPacket, *TUN) filter.Response
+type FilterFunc func(*packet.Parsed, *TUN) filter.Response
 
 // TUN wraps a tun.Device from wireguard-go,
 // augmenting it with filtering and packet injection.
@@ -67,7 +68,7 @@ type TUN struct {
 
 	lastActivityAtomic int64 // unix seconds of last send or receive
 
-	destIPActivity atomic.Value // of map[packet.IP]func()
+	destIPActivity atomic.Value // of map[netaddr.IP]func()
 
 	// buffer stores the oldest unconsumed packet from tdev.
 	// It is made a static buffer in order to avoid allocations.
@@ -136,7 +137,7 @@ func WrapTUN(logf logger.Logf, tdev tun.Device) *TUN {
 // destination (the map keys).
 //
 // The map ownership passes to the TUN. It must be non-nil.
-func (t *TUN) SetDestIPActivityFuncs(m map[packet.IP4]func()) {
+func (t *TUN) SetDestIPActivityFuncs(m map[netaddr.IP]func()) {
 	t.destIPActivity.Store(m)
 }
 
@@ -214,7 +215,7 @@ func (t *TUN) poll() {
 	}
 }
 
-func (t *TUN) filterOut(p *packet.ParsedPacket) filter.Response {
+func (t *TUN) filterOut(p *packet.Parsed) filter.Response {
 
 	if t.PreFilterOut != nil {
 		if t.PreFilterOut(p, t) == filter.Drop {
@@ -278,12 +279,12 @@ func (t *TUN) Read(buf []byte, offset int) (int, error) {
 		}
 	}
 
-	p := parsedPacketPool.Get().(*packet.ParsedPacket)
+	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf[offset : offset+n])
 
-	if m, ok := t.destIPActivity.Load().(map[packet.IP4]func()); ok {
-		if fn := m[p.DstIP]; fn != nil {
+	if m, ok := t.destIPActivity.Load().(map[netaddr.IP]func()); ok {
+		if fn := m[p.Dst.IP]; fn != nil {
 			fn()
 		}
 	}
@@ -301,7 +302,7 @@ func (t *TUN) Read(buf []byte, offset int) (int, error) {
 }
 
 func (t *TUN) filterIn(buf []byte) filter.Response {
-	p := parsedPacketPool.Get().(*packet.ParsedPacket)
+	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf)
 

@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 	"tailscale.com/atomicfile"
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
@@ -35,6 +35,7 @@ import (
 	"tailscale.com/paths"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/racebuild"
 	"tailscale.com/version"
 )
 
@@ -48,7 +49,7 @@ type Config struct {
 // Policy is a logger and its public ID.
 type Policy struct {
 	// Logtail is the logger.
-	Logtail logtail.Logger
+	Logtail *logtail.Logger
 	// PublicID is the logger's instance identifier.
 	PublicID logtail.PublicID
 }
@@ -310,7 +311,7 @@ func tryFixLogStateLocation(dir, cmdname string) {
 // given collection name.
 func New(collection string) *Policy {
 	var lflags int
-	if terminal.IsTerminal(2) || runtime.GOOS == "windows" {
+	if term.IsTerminal(2) || runtime.GOOS == "windows" {
 		lflags = 0
 	} else {
 		lflags = log.LstdFlags
@@ -390,13 +391,13 @@ func New(collection string) *Policy {
 	if filchBuf != nil {
 		c.Buffer = filchBuf
 	}
-	lw := logtail.Log(c, log.Printf)
+	lw := logtail.NewLogger(c, log.Printf)
 	log.SetFlags(0) // other logflags are set on console, not here
 	log.SetOutput(lw)
 
 	log.Printf("Program starting: v%v, Go %v: %#v",
 		version.Long,
-		strings.TrimPrefix(runtime.Version(), "go"),
+		goVersion(),
 		os.Args)
 	log.Printf("LogID: %v", newc.PublicID)
 	if filchErr != nil {
@@ -410,6 +411,15 @@ func New(collection string) *Policy {
 		Logtail:  lw,
 		PublicID: newc.PublicID,
 	}
+}
+
+// SetVerbosityLevel controls the verbosity level that should be
+// written to stderr. 0 is the default (not verbose). Levels 1 or higher
+// are increasingly verbose.
+//
+// It should not be changed concurrently with log writes.
+func (p *Policy) SetVerbosityLevel(level int) {
+	p.Logtail.SetVerbosityLevel(level)
 }
 
 // Close immediately shuts down the logger.
@@ -478,4 +488,12 @@ func newLogtailTransport(host string) *http.Transport {
 	tr.TLSClientConfig = tlsdial.Config(host, tr.TLSClientConfig)
 
 	return tr
+}
+
+func goVersion() string {
+	v := strings.TrimPrefix(runtime.Version(), "go")
+	if racebuild.On {
+		return v + "-race"
+	}
+	return v
 }

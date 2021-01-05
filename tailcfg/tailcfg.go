@@ -13,7 +13,6 @@ import (
 	"reflect"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/tailscale/wireguard-go/wgcfg"
 	"go4.org/mem"
@@ -113,8 +112,6 @@ type User struct {
 	Logins        []LoginID
 	Roles         []RoleID
 	Created       time.Time
-
-	// Note: be sure to update Clone when adding new fields
 }
 
 type Login struct {
@@ -154,12 +151,9 @@ type Node struct {
 	Created    time.Time
 	LastSeen   *time.Time `json:",omitempty"`
 
-	KeepAlive bool // open and keep open a connection to this peer
+	KeepAlive bool `json:",omitempty"` // open and keep open a connection to this peer
 
-	MachineAuthorized bool // TODO(crawshaw): replace with MachineStatus
-
-	// NOTE: any new fields containing pointers in this type
-	//       require changes to Node.Clone.
+	MachineAuthorized bool `json:",omitempty"` // TODO(crawshaw): replace with MachineStatus
 }
 
 type MachineStatus int
@@ -211,8 +205,13 @@ func (m MachineStatus) String() string {
 	}
 }
 
-func isNum(r rune) bool   { return r >= '0' && r <= '9' }
-func isAlpha(r rune) bool { return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') }
+func isNum(b byte) bool {
+	return b >= '0' && b <= '9'
+}
+
+func isAlpha(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
 
 // CheckTag validates tag for use as an ACL tag.
 // For now we allow only ascii alphanumeric tags, and they need to start
@@ -227,34 +226,20 @@ func CheckTag(tag string) error {
 	if !strings.HasPrefix(tag, "tag:") {
 		return errors.New("tags must start with 'tag:'")
 	}
-	suffix := tag[len("tag:"):]
-	if err := CheckTagSuffix(suffix); err != nil {
-		return fmt.Errorf("invalid tag %q: %w", tag, err)
-	}
-	return nil
-}
-
-// CheckTagSuffix checks whether tag is a valid tag suffix (the part
-// appearing after "tag:"). The error message does not reference
-// "tag:", so it's suitable for use by the "tailscale up" CLI tool
-// where the "tag:" isn't required. The returned error also does not
-// reference the tag itself, so the caller can wrap it as needed with
-// either the full or short form.
-func CheckTagSuffix(tag string) error {
+	tag = tag[4:]
 	if tag == "" {
 		return errors.New("tag names must not be empty")
 	}
-	if i := strings.IndexFunc(tag, func(r rune) bool { return r >= utf8.RuneSelf }); i != -1 {
-		return errors.New("tag names must only contain ASCII")
+	if !isAlpha(tag[0]) {
+		return errors.New("tag names must start with a letter, after 'tag:'")
 	}
-	if !isAlpha(rune(tag[0])) {
-		return errors.New("tag name must start with a letter")
-	}
-	for _, r := range tag {
-		if !isNum(r) && !isAlpha(r) && r != '-' {
+
+	for _, b := range []byte(tag) {
+		if !isNum(b) && !isAlpha(b) && b != '-' {
 			return errors.New("tag names can only contain numbers, letters, or dashes")
 		}
 	}
+
 	return nil
 }
 
@@ -285,9 +270,6 @@ type Service struct {
 	Description string       `json:",omitempty"` // text description of service
 	// TODO(apenwarr): allow advertising services on subnet IPs?
 	// TODO(apenwarr): add "tags" here for each service?
-
-	// NOTE: any new fields containing pointers in this type
-	//       require changes to Hostinfo.Clone.
 }
 
 // Hostinfo contains a summary of a Tailscale host.
@@ -297,13 +279,15 @@ type Service struct {
 type Hostinfo struct {
 	// TODO(crawshaw): mark all these fields ",omitempty" when all the
 	// iOS apps are updated with the latest swift version of this struct.
-	IPNVersion    string       // version of this code
+	IPNVersion    string       `json:",omitempty"` // version of this code
 	FrontendLogID string       `json:",omitempty"` // logtail ID of frontend instance
 	BackendLogID  string       `json:",omitempty"` // logtail ID of backend instance
 	OS            string       // operating system the client runs on (a version.OS value)
 	OSVersion     string       `json:",omitempty"` // operating system version, with optional distro prefix ("Debian 10.4", "Windows 10 Pro 10.0.19041")
 	DeviceModel   string       `json:",omitempty"` // mobile phone model ("Pixel 3a", "iPhone 11 Pro")
 	Hostname      string       // name of the host the client runs on
+	ShieldsUp     bool         `json:",omitempty"` // indicates whether the host is blocking incoming connections
+	ShareeNode    bool         `json:",omitempty"` // indicates this node exists in netmap because it's owned by a shared-to user
 	GoArch        string       `json:",omitempty"` // the host's GOARCH value (of the running binary)
 	RoutableIPs   []wgcfg.CIDR `json:",omitempty"` // set of IP ranges this client can route
 	RequestTags   []string     `json:",omitempty"` // set of ACL tags this node wants to claim
@@ -311,7 +295,7 @@ type Hostinfo struct {
 	NetInfo       *NetInfo     `json:",omitempty"`
 
 	// NOTE: any new fields containing pointers in this type
-	//       require changes to Hostinfo.Clone and Hostinfo.Equal.
+	//       require changes to Hostinfo.Equal.
 }
 
 // NetInfo contains information about the host's network state.
@@ -363,7 +347,7 @@ type NetInfo struct {
 	// the control plane.
 	DERPLatency map[string]float64 `json:",omitempty"`
 
-	// Update Clone and BasicallyEqual when adding fields.
+	// Update BasicallyEqual when adding fields.
 }
 
 func (ni *NetInfo) String() string {
@@ -491,7 +475,10 @@ type MapRequest struct {
 	// History of versions:
 	//     3: implicit compression, keep-alives
 	//     4: opt-in keep-alives via KeepAlive field, opt-in compression via Compress
-	//     5: 2020-10-19, implies IncludeIPv6, DeltaPeers/DeltaUserProfiles, supports MagicDNS
+	//     5: 2020-10-19, implies IncludeIPv6, delta Peers/UserProfiles, supports MagicDNS
+	//     6: 2020-12-07: means MapResponse.PacketFilter nil means unchanged
+	//     7: 2020-12-15: FilterRule.SrcIPs accepts CIDRs+ranges, doesn't warn about 0.0.0.0/::
+	//     8: 2020-12-19: client can receive IPv6 addresses and routes if beta enabled server-side
 	Version     int
 	Compress    string // "zstd" or "" (no compression)
 	KeepAlive   bool   // whether server should send keep-alives back to us
@@ -514,6 +501,10 @@ type MapRequest struct {
 	// OmitPeers is whether the client is okay with the Peers list
 	// being omitted in the response. (For example, a client on
 	// start up using ReadOnly to get the DERP map.)
+	//
+	// If OmitPeers is true, Stream is false, and ReadOnly is false,
+	// then the server will let clients update their endpoints without
+	// breaking existing long-polling (Stream == true) connections.
 	OmitPeers bool `json:",omitempty"`
 
 	// DebugFlags is a list of strings specifying debugging and
@@ -528,6 +519,8 @@ type MapRequest struct {
 	//       router but their IP forwarding is broken.
 	//     * "v6-overlay": IPv6 development flag to have control send
 	//       v6 node addrs
+	//     * "minimize-netmap": have control minimize the netmap, removing
+	//       peers that are unreachable per ACLS.
 	DebugFlags []string `json:",omitempty"`
 }
 
@@ -539,11 +532,11 @@ type PortRange struct {
 
 var PortRangeAny = PortRange{0, 65535}
 
-// NetPortRange represents a single subnet:portrange.
+// NetPortRange represents a range of ports that's allowed for one or more IPs.
 type NetPortRange struct {
 	_     structs.Incomparable
-	IP    string // "*" means all
-	Bits  *int   // backward compatibility: if missing, means "all" bits
+	IP    string // IP, CIDR, Range, or "*" (same formats as FilterRule.SrcIPs)
+	Bits  *int   // deprecated; the old way to turn IP into a CIDR
 	Ports PortRange
 }
 
@@ -554,18 +547,25 @@ type NetPortRange struct {
 // allowed if a source IP is mathces of those CIDRs.
 type FilterRule struct {
 	// SrcIPs are the source IPs/networks to match.
-	// The special value "*" means to match all.
+	//
+	// It may take the following forms:
+	//     * an IP address (IPv4 or IPv6)
+	//     * the string "*" to match everything (both IPv4 & IPv6)
+	//     * a CIDR (e.g. "192.168.0.0/16")
+	//     * a range of two IPs, inclusive, separated by hyphen ("2eff::1-2eff::0800")
 	SrcIPs []string
 
-	// SrcBits values correspond to the SrcIPs above.
+	// SrcBits is deprecated; it's the old way to specify a CIDR
+	// prior to MapRequest.Version 7. Its values correspond to the
+	// SrcIPs above.
 	//
-	// If present at the same index, it changes the SrcIP above to
-	// be a network with /n CIDR bits. If the slice is nil or
-	// insufficiently long, the default value (for an IPv4
-	// address) for a position is 32, as if the SrcIPs above were
-	// a /32 mask. For a "*" SrcIPs value, the corresponding
-	// SrcBits value is ignored.
-	// TODO: for IPv6, clarify default bits length.
+	// If an entry of SrcBits is present for the same index as a
+	// SrcIPs entry, it changes the SrcIP above to be a network
+	// with /n CIDR bits. If the slice is nil or insufficiently
+	// long, the default value (for an IPv4 address) for a
+	// position is 32, as if the SrcIPs above were a /32 mask. For
+	// a "*" SrcIPs value, the corresponding SrcBits value is
+	// ignored.
 	SrcBits []int
 
 	// DstPorts are the port ranges to allow once a source IP
@@ -610,14 +610,15 @@ type MapResponse struct {
 
 	// Peers, if non-empty, is the complete list of peers.
 	// It will be set in the first MapResponse for a long-polled request/response.
-	// Subsequent responses will be delta-encoded if DeltaPeers was set in the request.
+	// Subsequent responses will be delta-encoded if MapRequest.Version >= 5 and server
+	// chooses, in which case Peers will be nil or zero length.
 	// If Peers is non-empty, PeersChanged and PeersRemoved should
 	// be ignored (and should be empty).
 	// Peers is always returned sorted by Node.ID.
 	Peers []*Node `json:",omitempty"`
 	// PeersChanged are the Nodes (identified by their ID) that
 	// have changed or been added since the past update on the
-	// HTTP response. It's only set if MapRequest.DeltaPeers was true.
+	// HTTP response. It's not used by the server if MapRequest.Version < 5.
 	// PeersChanged is always returned sorted by Node.ID.
 	PeersChanged []*Node `json:",omitempty"`
 	// PeersRemoved are the NodeIDs that are no longer in the peer list.
@@ -633,11 +634,25 @@ type MapResponse struct {
 	SearchPaths []string  `json:",omitempty"`
 	DNSConfig   DNSConfig `json:",omitempty"`
 
-	// ACLs
-	Domain       string
+	// Domain is the name of the network that this node is
+	// in. It's either of the form "example.com" (for user
+	// foo@example.com, for multi-user networks) or
+	// "foo@gmail.com" (for siloed users on shared email
+	// providers). Its exact form should not be depended on; new
+	// forms are coming later.
+	Domain string
+
+	// PacketFilter are the firewall rules.
+	//
+	// For MapRequest.Version >= 6, a nil value means the most
+	// previously streamed non-nil MapResponse.PacketFilter within
+	// the same HTTP response. A non-nil but empty list always means
+	// no PacketFilter (that is, to block everything).
 	PacketFilter []FilterRule
-	UserProfiles []UserProfile // as of 1.1.541: may be new or updated user profiles only
+
+	UserProfiles []UserProfile // as of 1.1.541 (mapver 5): may be new or updated user profiles only
 	Roles        []Role        // deprecated; clients should not rely on Roles
+
 	// TODO: Groups       []Group
 	// TODO: Capabilities []Capability
 
@@ -673,6 +688,10 @@ type Debug struct {
 	// TrimWGConfig controls whether Tailscale does lazy, on-demand
 	// wireguard configuration of peers.
 	TrimWGConfig opt.Bool `json:",omitempty"`
+
+	// DisableSubnetsIfPAC controls whether subnet routers should be
+	// disabled if WPAD is present on the network.
+	DisableSubnetsIfPAC opt.Bool `json:",omitempty"`
 }
 
 func (k MachineKey) String() string                   { return fmt.Sprintf("mkey:%x", k[:]) }

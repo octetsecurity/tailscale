@@ -34,6 +34,7 @@ import (
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/pidowner"
+	"tailscale.com/util/systemd"
 	"tailscale.com/version"
 	"tailscale.com/wgengine"
 )
@@ -265,12 +266,14 @@ func (s *server) serveConn(ctx context.Context, c net.Conn, logf logger.Logf) {
 	}
 
 	defer s.removeAndCloseConn(c)
-	logf("incoming control connection")
+	logf("[v1] incoming control connection")
 
 	for ctx.Err() == nil {
 		msg, err := ipn.ReadMsg(br)
 		if err != nil {
-			if ctx.Err() == nil {
+			if errors.Is(err, io.EOF) {
+				logf("[v1] ReadMsg: %v", err)
+			} else if ctx.Err() == nil {
 				logf("ReadMsg: %v", err)
 			}
 			return
@@ -589,6 +592,7 @@ func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (
 		})
 	}
 
+	systemd.Ready()
 	for i := 1; ctx.Err() == nil; i++ {
 		var c net.Conn
 		var err error
@@ -723,6 +727,10 @@ func BabysitProc(ctx context.Context, args []string, logf logger.Logf) {
 		// If the process finishes, clean up the write side of the
 		// pipe. We'll make a new one when we restart the subproc.
 		wStdin.Close()
+
+		if os.Getenv("TS_DEBUG_RESTART_CRASHED") == "0" {
+			log.Fatalf("Process ended.")
+		}
 
 		if time.Since(startTime) < 60*time.Second {
 			bo.BackOff(ctx, fmt.Errorf("subproc early exit: %v", err))
