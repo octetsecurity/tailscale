@@ -133,6 +133,12 @@ func idGenerator() int64 {
 	return int64(u)
 }
 
+func (s *ControlServer) broadcastNewHost(newHostNodeId tailcfg.NodeID) {
+	for _, nodeId := range s.knownHost {
+		s.hosts[nodeId].Peers = append(s.hosts[nodeId].Peers, newHostNodeId)
+	}
+}
+
 func (s *ControlServer) addNewHost(node *tailcfg.Node, derpMap *tailcfg.DERPMap,
 	knownHost map[tailcfg.MachineKey]tailcfg.NodeID, machineKey tailcfg.MachineKey) Host {
 	knownHostCopy := knownHost
@@ -154,8 +160,19 @@ func (s *ControlServer) addNewHost(node *tailcfg.Node, derpMap *tailcfg.DERPMap,
 
 	s.knownHost[machineKey] = node.ID
 	s.hosts[node.ID] = &host
+	s.broadcastNewHost(node.ID)
 
 	return host
+}
+
+func (s *ControlServer) broadcastHostChanged(changedNodeId tailcfg.NodeID) {
+	for _, nodeId := range s.knownHost {
+		for _, peerNodeId := range s.hosts[nodeId].Peers {
+			if peerNodeId == changedNodeId {
+				s.hosts[nodeId].PeersChanged = append(s.hosts[nodeId].PeersChanged, changedNodeId)
+			}
+		}
+	}
 }
 
 func (s *ControlServer) pollNetMapHandler(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +239,7 @@ func (s *ControlServer) pollNetMapHandler(w http.ResponseWriter, r *http.Request
 
 		if hostChanged {
 			// notify other hosts that their peer has changed
+			s.broadcastHostChanged(nodeId)
 		}
 
 		host.Node.KeepAlive = pollRequest.KeepAlive
