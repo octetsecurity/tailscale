@@ -6,6 +6,7 @@ import (
 	"github.com/tailscale/wireguard-go/wgcfg"
 	"io"
 	"net/http"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -66,9 +67,9 @@ func Router(s *ControlServer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case matchLoginRequest.MatchString(r.URL.Path):
-			loginHandler(s, w, r)
+			s.loginHandler(w, r)
 		case matchPollMapRequest.MatchString(r.URL.Path):
-			pollNetMapHandler(s, w, r)
+			s.pollNetMapHandler(w, r)
 		default:
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(200)
@@ -94,7 +95,7 @@ func matchClientMachineKey(reg *regexp.Regexp, url string) (wgcfg.Key, error) {
 	return clientKey, err
 }
 
-func loginHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
+func (s *ControlServer) loginHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		io.WriteString(w, "Method not allowed")
 		return
@@ -127,13 +128,13 @@ func loginHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
 	w.Write(resBody)
 }
 
-func idGenerator() (int64) {
+func idGenerator() int64 {
 	u := uuid.New().ID()
 	return int64(u)
 }
 
 func (s *ControlServer) addNewHost(node *tailcfg.Node, derpMap *tailcfg.DERPMap,
-	knownHost map[tailcfg.MachineKey]tailcfg.NodeID, machineKey tailcfg.MachineKey) (Host) {
+	knownHost map[tailcfg.MachineKey]tailcfg.NodeID, machineKey tailcfg.MachineKey) Host {
 	knownHostCopy := knownHost
 	delete(knownHostCopy, node.Machine)
 
@@ -157,7 +158,7 @@ func (s *ControlServer) addNewHost(node *tailcfg.Node, derpMap *tailcfg.DERPMap,
 	return host
 }
 
-func pollNetMapHandler(s *ControlServer, w http.ResponseWriter, r *http.Request) {
+func (s *ControlServer) pollNetMapHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		io.WriteString(w, "Method not allowed")
 		return
@@ -191,8 +192,50 @@ func pollNetMapHandler(s *ControlServer, w http.ResponseWriter, r *http.Request)
 		Debug:        nil,
 	}
 
-	if _, ok := s.knownHost[tailcfg.MachineKey(clientMachineKey)]; ok {
+	if nodeId, ok := s.knownHost[tailcfg.MachineKey(clientMachineKey)]; ok {
+		host := s.hosts[nodeId]
 
+		hostChanged := false
+
+		if pollRequest.NodeKey != host.Node.Key {
+			host.Node.Key = pollRequest.NodeKey
+			hostChanged = true
+		}
+
+		if pollRequest.DiscoKey != host.Node.DiscoKey {
+			host.Node.DiscoKey = pollRequest.DiscoKey
+			hostChanged = true
+		}
+
+		if !reflect.DeepEqual(pollRequest.Endpoints, host.Node.Endpoints) {
+			host.Node.Endpoints = pollRequest.Endpoints
+			hostChanged = true
+		}
+
+		if !pollRequest.Hostinfo.Equal(&host.Node.Hostinfo) {
+			// update node info
+			host.Node.AllowedIPs = pollRequest.Hostinfo.RoutableIPs
+			host.Node.DERP = strconv.Itoa(pollRequest.Hostinfo.NetInfo.PreferredDERP)
+			host.Node.Hostinfo = *pollRequest.Hostinfo
+			hostChanged = true
+		}
+
+		if hostChanged {
+			// notify other hosts that their peer has changed
+		}
+
+		host.Node.KeepAlive = pollRequest.KeepAlive
+
+		resp.Node = host.Node
+		resp.DERPMap = host.DERPMap
+
+		peersChanged := []*tailcfg.Node{}
+		for _, nodeId := range host.PeersChanged {
+			peersChanged = append(peersChanged, s.hosts[nodeId].Node)
+		}
+		resp.PeersChanged = peersChanged
+		// TODO: add peer remove logic
+		resp.PeersRemoved = host.PeersRemoved
 	} else {
 		nodeId := tailcfg.NodeID(idGenerator())
 		node := tailcfg.Node{
@@ -203,10 +246,10 @@ func pollNetMapHandler(s *ControlServer, w http.ResponseWriter, r *http.Request)
 			KeyExpiry:         time.Now().Add(time.Hour * 8760),
 			Machine:           tailcfg.MachineKey(clientMachineKey),
 			DiscoKey:          pollRequest.DiscoKey,
-			Addresses:		   pollRequest.Hostinfo.RoutableIPs, // TODO: need to put wireguard IP here, I guess it's the first item in allowedIps
+			Addresses:         pollRequest.Hostinfo.RoutableIPs, // TODO: need to put wireguard IP here, I guess it's the first item in allowedIps
 			AllowedIPs:        pollRequest.Hostinfo.RoutableIPs,
 			Endpoints:         pollRequest.Endpoints,
-			DERP: strconv.Itoa(pollRequest.Hostinfo.NetInfo.PreferredDERP),
+			DERP:              strconv.Itoa(pollRequest.Hostinfo.NetInfo.PreferredDERP),
 			Hostinfo:          *pollRequest.Hostinfo,
 			Created:           time.Now(),
 			LastSeen:          nil,
@@ -220,9 +263,7 @@ func pollNetMapHandler(s *ControlServer, w http.ResponseWriter, r *http.Request)
 		for _, nodeId := range host.Peers {
 			peers = append(peers, s.hosts[nodeId].Node)
 		}
-
 		resp.Peers = peers
-
 	}
 
 	resBody, err := encode(resp, &clientMachineKey, &s.privateKey)
