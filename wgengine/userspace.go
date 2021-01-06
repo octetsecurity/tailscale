@@ -37,6 +37,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/wgkey"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine/filter"
@@ -113,9 +114,9 @@ type userspaceEngine struct {
 	closing            bool       // Close was called (even if we're still closing)
 	statusCallback     StatusCallback
 	linkChangeCallback func(major bool, newState *interfaces.State)
-	peerSequence       []wgcfg.Key
+	peerSequence       []wgkey.Key
 	endpoints          []string
-	pingers            map[wgcfg.Key]*pinger // legacy pingers for pre-discovery peers
+	pingers            map[wgkey.Key]*pinger // legacy pingers for pre-discovery peers
 	linkState          *interfaces.State
 
 	// Lock ordering: magicsock.Conn.mu, wgLock, then mu.
@@ -202,7 +203,7 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 		waitCh:   make(chan struct{}),
 		tundev:   tstun.WrapTUN(logf, conf.TUN),
 		resolver: tsdns.NewResolver(rconf),
-		pingers:  make(map[wgcfg.Key]*pinger),
+		pingers:  make(map[wgkey.Key]*pinger),
 	}
 	e.localAddrs.Store(map[netaddr.IP]bool{})
 	e.linkState, _ = getLinkState()
@@ -278,17 +279,19 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 
 			// Ping every single-IP that peer routes.
 			// These synthetic packets are used to traverse NATs.
-			var ips []wgcfg.IP
+			var ips []netaddr.IP
 			allowedIPs := deviceAllowedIPs.EntriesForPeer(peer)
 			for _, ipNet := range allowedIPs {
 				if ones, bits := ipNet.Mask.Size(); ones == bits && ones != 0 {
-					var ip wgcfg.IP
-					copy(ip.Addr[:], ipNet.IP.To16())
+					ip, ok := netaddr.FromStdIP(ipNet.IP)
+					if !ok {
+						continue
+					}
 					ips = append(ips, ip)
 				}
 			}
 			if len(ips) > 0 {
-				go e.pinger(peerKey, ips)
+				go e.pinger(wgkey.Key(peerKey), ips)
 			} else {
 				logf("[unexpected] peer %s has no single-IP routes: %v", peerKey.ShortString(), allowedIPs)
 			}
@@ -485,7 +488,7 @@ func (p *pinger) close() {
 	<-p.done
 }
 
-func (p *pinger) run(ctx context.Context, peerKey wgcfg.Key, ips []wgcfg.IP, srcIP netaddr.IP) {
+func (p *pinger) run(ctx context.Context, peerKey wgkey.Key, ips []netaddr.IP, srcIP netaddr.IP) {
 	defer func() {
 		p.e.mu.Lock()
 		if p.e.pingers[peerKey] == p {
@@ -520,7 +523,7 @@ func (p *pinger) run(ctx context.Context, peerKey wgcfg.Key, ips []wgcfg.IP, src
 			// work.
 			continue
 		}
-		dstIPs = append(dstIPs, netaddr.IPFrom16(ip.Addr))
+		dstIPs = append(dstIPs, ip)
 	}
 
 	payload := []byte("magicsock_spray") // no meaning
@@ -554,13 +557,13 @@ func (p *pinger) run(ctx context.Context, peerKey wgcfg.Key, ips []wgcfg.IP, src
 //
 // This is only used with legacy peers (before 0.100.0) that don't
 // have advertised discovery keys.
-func (e *userspaceEngine) pinger(peerKey wgcfg.Key, ips []wgcfg.IP) {
+func (e *userspaceEngine) pinger(peerKey wgkey.Key, ips []netaddr.IP) {
 	e.logf("[v1] generating initial ping traffic to %s (%v)", peerKey.ShortString(), ips)
 	var srcIP netaddr.IP
 
 	e.wgLock.Lock()
 	if len(e.lastCfgFull.Addresses) > 0 {
-		srcIP = netaddr.IPFrom16(e.lastCfgFull.Addresses[0].IP.Addr)
+		srcIP = e.lastCfgFull.Addresses[0].IP
 	}
 	e.wgLock.Unlock()
 
@@ -642,9 +645,7 @@ func isTrimmablePeer(p *wgcfg.Peer, numPeers int) bool {
 
 	// AllowedIPs must all be single IPs, not subnets.
 	for _, aip := range p.AllowedIPs {
-		if aip.IP.Is4() && aip.Mask != 32 {
-			return false
-		} else if aip.IP.Is6() && aip.Mask != 128 {
+		if !aip.IsSingleIP() {
 			return false
 		}
 	}
@@ -684,12 +685,11 @@ func (e *userspaceEngine) noteReceiveActivity(dk tailcfg.DiscoKey) {
 // had a packet sent to or received from it since t.
 //
 // e.wgLock must be held.
-func (e *userspaceEngine) isActiveSince(dk tailcfg.DiscoKey, ip wgcfg.IP, t time.Time) bool {
+func (e *userspaceEngine) isActiveSince(dk tailcfg.DiscoKey, ip netaddr.IP, t time.Time) bool {
 	if e.recvActivityAt[dk].After(t) {
 		return true
 	}
-	pip := netaddr.IPFrom16(ip.Addr)
-	timePtr, ok := e.sentActivityAt[pip]
+	timePtr, ok := e.sentActivityAt[ip]
 	if !ok {
 		return false
 	}
@@ -746,7 +746,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Publ
 	// we'll need to install tracking hooks for to watch their
 	// send/receive activity.
 	trackDisco := make([]tailcfg.DiscoKey, 0, len(full.Peers))
-	trackIPs := make([]wgcfg.IP, 0, len(full.Peers))
+	trackIPs := make([]netaddr.IP, 0, len(full.Peers))
 
 	trimmedDisco := map[tailcfg.DiscoKey]bool{} // TODO: don't re-alloc this map each time
 
@@ -816,7 +816,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Publ
 // as given to wireguard-go.
 //
 // e.wgLock must be held.
-func (e *userspaceEngine) updateActivityMapsLocked(trackDisco []tailcfg.DiscoKey, trackIPs []wgcfg.IP) {
+func (e *userspaceEngine) updateActivityMapsLocked(trackDisco []tailcfg.DiscoKey, trackIPs []netaddr.IP) {
 	// Generate the new map of which discokeys we want to track
 	// receive times for.
 	mr := map[tailcfg.DiscoKey]time.Time{} // TODO: only recreate this if set of keys changed
@@ -857,19 +857,18 @@ func (e *userspaceEngine) updateActivityMapsLocked(trackDisco []tailcfg.DiscoKey
 		}
 	}
 
-	for _, wip := range trackIPs {
-		pip := netaddr.IPFrom16(wip.Addr)
-		timePtr := oldTime[pip]
+	for _, ip := range trackIPs {
+		timePtr := oldTime[ip]
 		if timePtr == nil {
 			timePtr = new(int64)
 		}
-		e.sentActivityAt[pip] = timePtr
+		e.sentActivityAt[ip] = timePtr
 
-		fn := oldFunc[pip]
+		fn := oldFunc[ip]
 		if fn == nil {
 			fn = updateFn(timePtr)
 		}
-		e.destIPActivityFuncs[pip] = fn
+		e.destIPActivityFuncs[ip] = fn
 	}
 	e.tundev.SetDestIPActivityFuncs(e.destIPActivityFuncs)
 }
@@ -892,7 +891,7 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config) 
 	e.mu.Lock()
 	e.peerSequence = e.peerSequence[:0]
 	for _, p := range cfg.Peers {
-		e.peerSequence = append(e.peerSequence, p.PublicKey)
+		e.peerSequence = append(e.peerSequence, wgkey.Key(p.PublicKey))
 		peerSet[key.Public(p.PublicKey)] = struct{}{}
 	}
 	e.mu.Unlock()
@@ -934,7 +933,7 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config) 
 	// (which is needed by DERP) before wgdev gets it, as wgdev
 	// will start trying to handshake, which we want to be able to
 	// go over DERP.
-	if err := e.magicConn.SetPrivateKey(cfg.PrivateKey); err != nil {
+	if err := e.magicConn.SetPrivateKey(wgkey.Private(cfg.PrivateKey)); err != nil {
 		e.logf("wgengine: Reconfig: SetPrivateKey: %v", err)
 	}
 	e.magicConn.UpdatePeers(peerSet)
@@ -1041,7 +1040,7 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 		errc <- bw.Flush()
 	}()
 
-	pp := make(map[wgcfg.Key]*PeerStatus)
+	pp := make(map[wgkey.Key]*PeerStatus)
 	p := &PeerStatus{}
 
 	var hst1, hst2, n int64
@@ -1064,7 +1063,7 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 				log.Fatalf("IpcGetOperation: invalid key %#v", v)
 			}
 			p = &PeerStatus{}
-			pp[wgcfg.Key(pk)] = p
+			pp[wgkey.Key(pk)] = p
 
 			key := tailcfg.NodeKey(pk)
 			p.NodeKey = key

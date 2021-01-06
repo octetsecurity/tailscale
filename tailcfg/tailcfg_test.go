@@ -11,7 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tailscale/wireguard-go/wgcfg"
+	"inet.af/netaddr"
+	"tailscale.com/types/wgkey"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
@@ -35,9 +36,9 @@ func TestHostinfoEqual(t *testing.T) {
 			have, hiHandles)
 	}
 
-	nets := func(strs ...string) (ns []wgcfg.CIDR) {
+	nets := func(strs ...string) (ns []netaddr.IPPrefix) {
 		for _, s := range strs {
-			n, err := wgcfg.ParseCIDR(s)
+			n, err := netaddr.ParseIPPrefix(s)
 			if err != nil {
 				panic(err)
 			}
@@ -187,15 +188,20 @@ func TestHostinfoEqual(t *testing.T) {
 }
 
 func TestNodeEqual(t *testing.T) {
-	nodeHandles := []string{"ID", "Name", "User", "Key", "KeyExpiry", "Machine", "DiscoKey", "Addresses", "AllowedIPs", "Endpoints", "DERP", "Hostinfo", "Created", "LastSeen", "KeepAlive", "MachineAuthorized"}
+	nodeHandles := []string{
+		"ID", "Name", "User", "Sharer",
+		"Key", "KeyExpiry", "Machine", "DiscoKey",
+		"Addresses", "AllowedIPs", "Endpoints", "DERP", "Hostinfo",
+		"Created", "LastSeen", "KeepAlive", "MachineAuthorized",
+	}
 	if have := fieldsOf(reflect.TypeOf(Node{})); !reflect.DeepEqual(have, nodeHandles) {
 		t.Errorf("Node.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, nodeHandles)
 	}
 
-	newPublicKey := func(t *testing.T) wgcfg.Key {
+	newPublicKey := func(t *testing.T) wgkey.Key {
 		t.Helper()
-		k, err := wgcfg.NewPrivateKey()
+		k, err := wgkey.NewPrivate()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -264,23 +270,23 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{Addresses: []wgcfg.CIDR{}},
+			&Node{Addresses: []netaddr.IPPrefix{}},
 			&Node{Addresses: nil},
 			false,
 		},
 		{
-			&Node{Addresses: []wgcfg.CIDR{}},
-			&Node{Addresses: []wgcfg.CIDR{}},
+			&Node{Addresses: []netaddr.IPPrefix{}},
+			&Node{Addresses: []netaddr.IPPrefix{}},
 			true,
 		},
 		{
-			&Node{AllowedIPs: []wgcfg.CIDR{}},
+			&Node{AllowedIPs: []netaddr.IPPrefix{}},
 			&Node{AllowedIPs: nil},
 			false,
 		},
 		{
-			&Node{Addresses: []wgcfg.CIDR{}},
-			&Node{Addresses: []wgcfg.CIDR{}},
+			&Node{Addresses: []netaddr.IPPrefix{}},
+			&Node{Addresses: []netaddr.IPPrefix{}},
 			true,
 		},
 		{
@@ -429,8 +435,8 @@ func TestCloneNode(t *testing.T) {
 	}{
 		{"nil_fields", &Node{}},
 		{"zero_fields", &Node{
-			Addresses:  make([]wgcfg.CIDR, 0),
-			AllowedIPs: make([]wgcfg.CIDR, 0),
+			Addresses:  make([]netaddr.IPPrefix, 0),
+			AllowedIPs: make([]netaddr.IPPrefix, 0),
 			Endpoints:  make([]string, 0),
 		}},
 	}

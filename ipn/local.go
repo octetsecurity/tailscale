@@ -29,6 +29,7 @@ import (
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/wgkey"
 	"tailscale.com/util/systemd"
 	"tailscale.com/version"
 	"tailscale.com/wgengine"
@@ -83,7 +84,7 @@ type LocalBackend struct {
 	userID         string   // current controlling user ID (for Windows, primarily)
 	prefs          *Prefs
 	inServerMode   bool
-	machinePrivKey wgcfg.PrivateKey
+	machinePrivKey wgkey.Private
 	state          State
 	// hostinfo is mutated in-place while mu is held.
 	hostinfo *tailcfg.Hostinfo
@@ -213,7 +214,7 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 				// The peer struct currently only allows a single
 				// Tailscale IP address. For compatibility with the
 				// old display, make sure it's the IPv4 address.
-				if addr.IP.Is4() && addr.Mask == 32 && tsaddr.IsTailscaleIP(netaddr.IPFrom16(addr.IP.Addr)) {
+				if addr.IP.Is4() && addr.IsSingleIP() && tsaddr.IsTailscaleIP(addr.IP) {
 					tailAddr = addr.IP.String()
 					break
 				}
@@ -534,9 +535,9 @@ func (b *LocalBackend) updateFilter(netMap *controlclient.NetworkMap, prefs *Pre
 	// quite hard to debug, so save yourself the trouble.
 	var (
 		haveNetmap   = netMap != nil
-		addrs        []wgcfg.CIDR
+		addrs        []netaddr.IPPrefix
 		packetFilter []filter.Match
-		advRoutes    []wgcfg.CIDR
+		advRoutes    []netaddr.IPPrefix
 		shieldsUp    = prefs == nil || prefs.ShieldsUp // Be conservative when not ready
 	)
 	if haveNetmap {
@@ -558,7 +559,7 @@ func (b *LocalBackend) updateFilter(netMap *controlclient.NetworkMap, prefs *Pre
 		return
 	}
 
-	localNets := wgCIDRsToNetaddr(netMap.Addresses, advRoutes)
+	localNets := unmapIPPrefixes(netMap.Addresses, advRoutes)
 
 	if shieldsUp {
 		b.logf("netmap packet filter: (shields up)")
@@ -572,7 +573,7 @@ func (b *LocalBackend) updateFilter(netMap *controlclient.NetworkMap, prefs *Pre
 
 // dnsCIDRsEqual determines whether two CIDR lists are equal
 // for DNS map construction purposes (that is, only the first entry counts).
-func dnsCIDRsEqual(newAddr, oldAddr []wgcfg.CIDR) bool {
+func dnsCIDRsEqual(newAddr, oldAddr []netaddr.IPPrefix) bool {
 	if len(newAddr) != len(oldAddr) {
 		return false
 	}
@@ -626,11 +627,11 @@ func (b *LocalBackend) updateDNSMap(netMap *controlclient.NetworkMap) {
 	}
 
 	nameToIP := make(map[string]netaddr.IP)
-	set := func(name string, addrs []wgcfg.CIDR) {
+	set := func(name string, addrs []netaddr.IPPrefix) {
 		if len(addrs) == 0 || name == "" {
 			return
 		}
-		nameToIP[name] = netaddr.IPFrom16(addrs[0].IP.Addr)
+		nameToIP[name] = addrs[0].IP
 	}
 
 	for _, peer := range netMap.Peers {
@@ -638,7 +639,7 @@ func (b *LocalBackend) updateDNSMap(netMap *controlclient.NetworkMap) {
 	}
 	set(netMap.Name, netMap.Addresses)
 
-	dnsMap := tsdns.NewMap(nameToIP, domainsForProxying(netMap))
+	dnsMap := tsdns.NewMap(nameToIP, magicDNSRootDomains(netMap))
 	// map diff will be logged in tsdns.Resolver.SetMap.
 	b.e.SetDNSMap(dnsMap)
 }
@@ -737,7 +738,7 @@ func (b *LocalBackend) initMachineKeyLocked() (err error) {
 		return nil
 	}
 
-	var legacyMachineKey wgcfg.PrivateKey
+	var legacyMachineKey wgkey.Private
 	if b.prefs.Persist != nil {
 		legacyMachineKey = b.prefs.Persist.LegacyFrontendPrivateMachineKey
 	}
@@ -772,7 +773,7 @@ func (b *LocalBackend) initMachineKeyLocked() (err error) {
 	} else {
 		b.logf("generating new machine key")
 		var err error
-		b.machinePrivKey, err = wgcfg.NewPrivateKey()
+		b.machinePrivKey, err = wgkey.NewPrivate()
 		if err != nil {
 			return fmt.Errorf("initializing new machine key: %w", err)
 		}
@@ -1064,7 +1065,7 @@ func (b *LocalBackend) SetPrefs(newp *Prefs) {
 
 	oldHi := b.hostinfo
 	newHi := oldHi.Clone()
-	newHi.RoutableIPs = append([]wgcfg.CIDR(nil), b.prefs.AdvertiseRoutes...)
+	newHi.RoutableIPs = append([]netaddr.IPPrefix(nil), b.prefs.AdvertiseRoutes...)
 	applyPrefsToHostinfo(newHi, newp)
 	b.hostinfo = newHi
 	hostInfoChanged := !oldHi.Equal(newHi)
@@ -1208,20 +1209,14 @@ func (b *LocalBackend) authReconfig() {
 
 	// If CorpDNS is false, rcfg.DNS remains the zero value.
 	if uc.CorpDNS {
-		domains := nm.DNS.Domains
 		proxied := nm.DNS.Proxied
-		if proxied {
-			if len(nm.DNS.Nameservers) == 0 {
-				b.logf("[unexpected] dns proxied but no nameservers")
-				proxied = false
-			} else {
-				// Domains for proxying should come first to avoid leaking queries.
-				domains = append(domainsForProxying(nm), domains...)
-			}
+		if proxied && len(nm.DNS.Nameservers) == 0 {
+			b.logf("[unexpected] dns proxied but no nameservers")
+			proxied = false
 		}
 		rcfg.DNS = dns.Config{
 			Nameservers: nm.DNS.Nameservers,
-			Domains:     domains,
+			Domains:     nm.DNS.Domains,
 			PerDomain:   nm.DNS.PerDomain,
 			Proxied:     proxied,
 		}
@@ -1234,53 +1229,44 @@ func (b *LocalBackend) authReconfig() {
 	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", uc.RouteAll, uc.CorpDNS, flags, err)
 }
 
-// domainsForProxying produces a list of search domains for proxied DNS.
-func domainsForProxying(nm *controlclient.NetworkMap) []string {
-	var domains []string
-	if idx := strings.IndexByte(nm.Name, '.'); idx != -1 {
-		domains = append(domains, nm.Name[idx+1:])
-	}
-	for _, peer := range nm.Peers {
-		idx := strings.IndexByte(peer.Name, '.')
-		if idx == -1 {
-			continue
+// magicDNSRootDomains returns the subset of nm.DNS.Domains that are the search domains for MagicDNS.
+// Each entry has a trailing period.
+func magicDNSRootDomains(nm *controlclient.NetworkMap) []string {
+	searchPathUsedAsDNSSuffix := func(suffix string) bool {
+		if tsdns.NameHasSuffix(nm.Name, suffix) {
+			return true
 		}
-		domain := peer.Name[idx+1:]
-		seen := false
-		// In theory this makes the function O(n^2) worst case,
-		// but in practice we expect domains to contain very few elements
-		// (only one until invitations are introduced).
-		for _, seenDomain := range domains {
-			if domain == seenDomain {
-				seen = true
+		for _, p := range nm.Peers {
+			if tsdns.NameHasSuffix(p.Name, suffix) {
+				return true
 			}
 		}
-		if !seen {
-			domains = append(domains, domain)
+		return false
+	}
+
+	var ret []string
+	for _, d := range nm.DNS.Domains {
+		if searchPathUsedAsDNSSuffix(d) {
+			if !strings.HasSuffix(d, ".") {
+				d += "."
+			}
+			ret = append(ret, d)
 		}
 	}
-	return domains
+	return ret
 }
 
 // routerConfig produces a router.Config from a wireguard config and IPN prefs.
 func routerConfig(cfg *wgcfg.Config, prefs *Prefs) *router.Config {
-	var addrs []wgcfg.CIDR
-	for _, addr := range cfg.Addresses {
-		addrs = append(addrs, wgcfg.CIDR{
-			IP:   addr.IP,
-			Mask: addr.Mask,
-		})
-	}
-
 	rs := &router.Config{
-		LocalAddrs:       wgCIDRsToNetaddr(addrs),
-		SubnetRoutes:     wgCIDRsToNetaddr(prefs.AdvertiseRoutes),
+		LocalAddrs:       unmapIPPrefixes(cfg.Addresses),
+		SubnetRoutes:     unmapIPPrefixes(prefs.AdvertiseRoutes),
 		SNATSubnetRoutes: !prefs.NoSNAT,
 		NetfilterMode:    prefs.NetfilterMode,
 	}
 
 	for _, peer := range cfg.Peers {
-		rs.Routes = append(rs.Routes, wgCIDRsToNetaddr(peer.AllowedIPs)...)
+		rs.Routes = append(rs.Routes, unmapIPPrefixes(peer.AllowedIPs)...)
 	}
 
 	rs.Routes = append(rs.Routes, netaddr.IPPrefix{
@@ -1291,15 +1277,10 @@ func routerConfig(cfg *wgcfg.Config, prefs *Prefs) *router.Config {
 	return rs
 }
 
-func wgCIDRsToNetaddr(cidrLists ...[]wgcfg.CIDR) (ret []netaddr.IPPrefix) {
-	for _, cidrs := range cidrLists {
-		for _, cidr := range cidrs {
-			ncidr, ok := netaddr.FromStdIPNet(cidr.IPNet())
-			if !ok {
-				panic(fmt.Sprintf("conversion of %s from wgcfg to netaddr IPNet failed", cidr))
-			}
-			ncidr.IP = ncidr.IP.Unmap()
-			ret = append(ret, ncidr)
+func unmapIPPrefixes(ippsList ...[]netaddr.IPPrefix) (ret []netaddr.IPPrefix) {
+	for _, ipps := range ippsList {
+		for _, ipp := range ipps {
+			ret = append(ret, netaddr.IPPrefix{IP: ipp.IP.Unmap(), Bits: ipp.Bits})
 		}
 	}
 	return ret

@@ -42,6 +42,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/nettype"
+	"tailscale.com/types/wgkey"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/tstun"
 )
@@ -119,7 +120,7 @@ func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, st
 // necessary to send and receive packets to test e2e wireguard
 // happiness.
 type magicStack struct {
-	privateKey wgcfg.PrivateKey
+	privateKey wgkey.Private
 	epCh       chan []string       // endpoint updates produced by this peer
 	conn       *Conn               // the magicsock itself
 	tun        *tuntest.ChannelTUN // TUN device to send/receive packets
@@ -133,7 +134,7 @@ type magicStack struct {
 func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap) *magicStack {
 	t.Helper()
 
-	privateKey, err := wgcfg.NewPrivateKey()
+	privateKey, err := wgkey.NewPrivate()
 	if err != nil {
 		t.Fatalf("generating private key: %v", err)
 	}
@@ -248,13 +249,13 @@ func meshStacks(logf logger.Logf, ms []*magicStack) (cleanup func()) {
 		nm := &controlclient.NetworkMap{
 			PrivateKey: me.privateKey,
 			NodeKey:    tailcfg.NodeKey(me.privateKey.Public()),
-			Addresses:  []wgcfg.CIDR{{IP: wgcfg.IPv4(1, 0, 0, byte(myIdx+1)), Mask: 32}},
+			Addresses:  []netaddr.IPPrefix{{IP: netaddr.IPv4(1, 0, 0, byte(myIdx+1)), Bits: 32}},
 		}
 		for i, peer := range ms {
 			if i == myIdx {
 				continue
 			}
-			addrs := []wgcfg.CIDR{{IP: wgcfg.IPv4(1, 0, 0, byte(i+1)), Mask: 32}}
+			addrs := []netaddr.IPPrefix{{IP: netaddr.IPv4(1, 0, 0, byte(i+1)), Bits: 32}}
 			peer := &tailcfg.Node{
 				ID:         tailcfg.NodeID(i + 1),
 				Name:       fmt.Sprintf("node%d", i+1),
@@ -347,7 +348,7 @@ func TestNewConn(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetDERPMap(stuntest.DERPMapOf(stunAddr.String()))
-	conn.SetPrivateKey(wgcfg.PrivateKey(key.NewPrivate()))
+	conn.SetPrivateKey(wgkey.Private(key.NewPrivate()))
 	conn.Start()
 
 	go func() {
@@ -454,16 +455,16 @@ func makeConfigs(t *testing.T, addrs []netaddr.IPPort) []wgcfg.Config {
 	t.Helper()
 
 	var privKeys []wgcfg.PrivateKey
-	var addresses [][]wgcfg.CIDR
+	var addresses [][]netaddr.IPPrefix
 
 	for i := range addrs {
-		privKey, err := wgcfg.NewPrivateKey()
+		privKey, err := wgkey.NewPrivate()
 		if err != nil {
 			t.Fatal(err)
 		}
-		privKeys = append(privKeys, privKey)
+		privKeys = append(privKeys, wgcfg.PrivateKey(privKey))
 
-		addresses = append(addresses, []wgcfg.CIDR{
+		addresses = append(addresses, []netaddr.IPPrefix{
 			parseCIDR(t, fmt.Sprintf("1.0.0.%d/32", i+1)),
 		})
 	}
@@ -496,9 +497,9 @@ func makeConfigs(t *testing.T, addrs []netaddr.IPPort) []wgcfg.Config {
 	return cfgs
 }
 
-func parseCIDR(t *testing.T, addr string) wgcfg.CIDR {
+func parseCIDR(t *testing.T, addr string) netaddr.IPPrefix {
 	t.Helper()
-	cidr, err := wgcfg.ParseCIDR(addr)
+	cidr, err := netaddr.ParseIPPrefix(addr)
 	if err != nil {
 		t.Fatal(err)
 	}

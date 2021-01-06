@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tailscale/wireguard-go/wgcfg"
 	"go4.org/mem"
 	"golang.org/x/oauth2"
 	"inet.af/netaddr"
@@ -22,6 +21,18 @@ import (
 	"tailscale.com/types/opt"
 	"tailscale.com/types/structs"
 )
+
+// CurrentMapRequestVersion is the current MapRequest.Version value.
+//
+// History of versions:
+//     3: implicit compression, keep-alives
+//     4: opt-in keep-alives via KeepAlive field, opt-in compression via Compress
+//     5: 2020-10-19, implies IncludeIPv6, delta Peers/UserProfiles, supports MagicDNS
+//     6: 2020-12-07: means MapResponse.PacketFilter nil means unchanged
+//     7: 2020-12-15: FilterRule.SrcIPs accepts CIDRs+ranges, doesn't warn about 0.0.0.0/::
+//     8: 2020-12-19: client can receive IPv6 addresses and routes if beta enabled server-side
+//     9: 2020-12-30: client doesn't auto-add implicit search domains from peers; only DNSConfig.Domains
+const CurrentMapRequestVersion = 9
 
 type ID int64
 
@@ -136,17 +147,25 @@ type UserProfile struct {
 }
 
 type Node struct {
-	ID         NodeID
-	Name       string // DNS
-	User       UserID
+	ID   NodeID
+	Name string // DNS
+
+	// User is the user who created the node. If ACL tags are in
+	// use for the node then it doesn't reflect the ACL identity
+	// that the node is running as.
+	User UserID
+
+	// Sharer, if non-zero, is the user who shared this node, if different than User.
+	Sharer UserID `json:",omitempty"`
+
 	Key        NodeKey
 	KeyExpiry  time.Time
 	Machine    MachineKey
 	DiscoKey   DiscoKey
-	Addresses  []wgcfg.CIDR // IP addresses of this Node directly
-	AllowedIPs []wgcfg.CIDR // range of IP addresses to route to this node
-	Endpoints  []string     `json:",omitempty"` // IP+port (public via STUN, and local LANs)
-	DERP       string       `json:",omitempty"` // DERP-in-IP:port ("127.3.3.40:N") endpoint
+	Addresses  []netaddr.IPPrefix // IP addresses of this Node directly
+	AllowedIPs []netaddr.IPPrefix // range of IP addresses to route to this node
+	Endpoints  []string           `json:",omitempty"` // IP+port (public via STUN, and local LANs)
+	DERP       string             `json:",omitempty"` // DERP-in-IP:port ("127.3.3.40:N") endpoint
 	Hostinfo   Hostinfo
 	Created    time.Time
 	LastSeen   *time.Time `json:",omitempty"`
@@ -279,20 +298,20 @@ type Service struct {
 type Hostinfo struct {
 	// TODO(crawshaw): mark all these fields ",omitempty" when all the
 	// iOS apps are updated with the latest swift version of this struct.
-	IPNVersion    string       `json:",omitempty"` // version of this code
-	FrontendLogID string       `json:",omitempty"` // logtail ID of frontend instance
-	BackendLogID  string       `json:",omitempty"` // logtail ID of backend instance
-	OS            string       // operating system the client runs on (a version.OS value)
-	OSVersion     string       `json:",omitempty"` // operating system version, with optional distro prefix ("Debian 10.4", "Windows 10 Pro 10.0.19041")
-	DeviceModel   string       `json:",omitempty"` // mobile phone model ("Pixel 3a", "iPhone 11 Pro")
-	Hostname      string       // name of the host the client runs on
-	ShieldsUp     bool         `json:",omitempty"` // indicates whether the host is blocking incoming connections
-	ShareeNode    bool         `json:",omitempty"` // indicates this node exists in netmap because it's owned by a shared-to user
-	GoArch        string       `json:",omitempty"` // the host's GOARCH value (of the running binary)
-	RoutableIPs   []wgcfg.CIDR `json:",omitempty"` // set of IP ranges this client can route
-	RequestTags   []string     `json:",omitempty"` // set of ACL tags this node wants to claim
-	Services      []Service    `json:",omitempty"` // services advertised by this machine
-	NetInfo       *NetInfo     `json:",omitempty"`
+	IPNVersion    string             `json:",omitempty"` // version of this code
+	FrontendLogID string             `json:",omitempty"` // logtail ID of frontend instance
+	BackendLogID  string             `json:",omitempty"` // logtail ID of backend instance
+	OS            string             // operating system the client runs on (a version.OS value)
+	OSVersion     string             `json:",omitempty"` // operating system version, with optional distro prefix ("Debian 10.4", "Windows 10 Pro 10.0.19041")
+	DeviceModel   string             `json:",omitempty"` // mobile phone model ("Pixel 3a", "iPhone 11 Pro")
+	Hostname      string             // name of the host the client runs on
+	ShieldsUp     bool               `json:",omitempty"` // indicates whether the host is blocking incoming connections
+	ShareeNode    bool               `json:",omitempty"` // indicates this node exists in netmap because it's owned by a shared-to user
+	GoArch        string             `json:",omitempty"` // the host's GOARCH value (of the running binary)
+	RoutableIPs   []netaddr.IPPrefix `json:",omitempty"` // set of IP ranges this client can route
+	RequestTags   []string           `json:",omitempty"` // set of ACL tags this node wants to claim
+	Services      []Service          `json:",omitempty"` // services advertised by this machine
+	NetInfo       *NetInfo           `json:",omitempty"`
 
 	// NOTE: any new fields containing pointers in this type
 	//       require changes to Hostinfo.Equal.
@@ -472,14 +491,9 @@ type MapRequest struct {
 	// we want to signal to the control server that we're capable of something
 	// different.
 	//
-	// History of versions:
-	//     3: implicit compression, keep-alives
-	//     4: opt-in keep-alives via KeepAlive field, opt-in compression via Compress
-	//     5: 2020-10-19, implies IncludeIPv6, delta Peers/UserProfiles, supports MagicDNS
-	//     6: 2020-12-07: means MapResponse.PacketFilter nil means unchanged
-	//     7: 2020-12-15: FilterRule.SrcIPs accepts CIDRs+ranges, doesn't warn about 0.0.0.0/::
-	//     8: 2020-12-19: client can receive IPv6 addresses and routes if beta enabled server-side
-	Version     int
+	// For current values and history, see CurrentMapRequestVersion above.
+	Version int
+
 	Compress    string // "zstd" or "" (no compression)
 	KeepAlive   bool   // whether server should send keep-alives back to us
 	NodeKey     NodeKey
@@ -566,7 +580,7 @@ type FilterRule struct {
 	// position is 32, as if the SrcIPs above were a /32 mask. For
 	// a "*" SrcIPs value, the corresponding SrcBits value is
 	// ignored.
-	SrcBits []int
+	SrcBits []int `json:",omitempty"`
 
 	// DstPorts are the port ranges to allow once a source IP
 	// matches (is in the CIDR described by SrcIPs & SrcBits).
@@ -627,12 +641,21 @@ type MapResponse struct {
 	// DNS is the same as DNSConfig.Nameservers.
 	//
 	// TODO(dmytro): should be sent in DNSConfig.Nameservers once clients have updated.
-	DNS []wgcfg.IP `json:",omitempty"`
-	// SearchPaths are the same as DNSConfig.Domains.
+	DNS []netaddr.IP `json:",omitempty"`
+
+	// SearchPaths is the old way to specify DNS search
+	// domains. Clients should use these values if set, but the
+	// server will omit this field for clients with
+	// MapRequest.Version >= 9. Clients should prefer to use
+	// DNSConfig.Domains instead.
+	SearchPaths []string `json:",omitempty"`
+
+	// DNSConfig contains the DNS settings for the client to use.
 	//
-	// TODO(dmytro): should be sent in DNSConfig.Domains once clients have updated.
-	SearchPaths []string  `json:",omitempty"`
-	DNSConfig   DNSConfig `json:",omitempty"`
+	// TODO(bradfitz): make this a pointer and conditionally sent
+	// only if changed, like DERPMap, PacketFilter, etc. It's
+	// small, though.
+	DNSConfig DNSConfig `json:",omitempty"`
 
 	// Domain is the name of the network that this node is
 	// in. It's either of the form "example.com" (for user
@@ -754,6 +777,7 @@ func (n *Node) Equal(n2 *Node) bool {
 		n.ID == n2.ID &&
 		n.Name == n2.Name &&
 		n.User == n2.User &&
+		n.Sharer == n2.Sharer &&
 		n.Key == n2.Key &&
 		n.KeyExpiry.Equal(n2.KeyExpiry) &&
 		n.Machine == n2.Machine &&
@@ -780,7 +804,7 @@ func eqStrings(a, b []string) bool {
 	return true
 }
 
-func eqCIDRs(a, b []wgcfg.CIDR) bool {
+func eqCIDRs(a, b []netaddr.IPPrefix) bool {
 	if len(a) != len(b) || ((a == nil) != (b == nil)) {
 		return false
 	}

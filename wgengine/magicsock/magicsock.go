@@ -52,6 +52,7 @@ import (
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/structs"
+	"tailscale.com/types/wgkey"
 	"tailscale.com/version"
 )
 
@@ -702,18 +703,17 @@ func peerForIP(nm *controlclient.NetworkMap, ip netaddr.IP) (n *tailcfg.Node, ok
 	if nm == nil {
 		return nil, false
 	}
-	wgIP := wgcfg.IP{Addr: ip.As16()}
 	// Check for exact matches before looking for subnet matches.
 	for _, p := range nm.Peers {
 		for _, a := range p.Addresses {
-			if a.IP == wgIP {
+			if a.IP == ip {
 				return p, true
 			}
 		}
 	}
 	for _, p := range nm.Peers {
 		for _, cidr := range p.AllowedIPs {
-			if cidr.Contains(wgIP) {
+			if cidr.Contains(ip) {
 				return p, true
 			}
 		}
@@ -988,12 +988,16 @@ var errConnClosed = errors.New("Conn closed")
 
 var errDropDerpPacket = errors.New("too many DERP packets queued; dropping")
 
+var udpAddrPool = &sync.Pool{
+	New: func() interface{} { return new(net.UDPAddr) },
+}
+
 // sendUDP sends UDP packet b to ipp.
 // See sendAddr's docs on the return value meanings.
 func (c *Conn) sendUDP(ipp netaddr.IPPort, b []byte) (sent bool, err error) {
-	ua := ipp.UDPAddr()
-	defer netaddr.PutUDPAddr(ua)
-	return c.sendUDPStd(ua, b)
+	ua := udpAddrPool.Get().(*net.UDPAddr)
+	defer udpAddrPool.Put(ua)
+	return c.sendUDPStd(ipp.UDPAddrAt(ua), b)
 }
 
 // sendUDP sends UDP packet b to addr.
@@ -1563,7 +1567,7 @@ Top:
 		} else if asEp != nil {
 			ep = asEp
 		} else {
-			key := wgcfg.Key(dm.src)
+			key := wgkey.Key(dm.src)
 			c.logf("magicsock: DERP packet from unknown key: %s", key.ShortString())
 			// TODO(danderson): after we fail to find a DERP endpoint, we
 			// seem to be falling through to passing the packet to
@@ -1953,7 +1957,7 @@ func (c *Conn) SetNetworkUp(up bool) {
 //
 // If the private key changes, any DERP connections are torn down &
 // recreated when needed.
-func (c *Conn) SetPrivateKey(privateKey wgcfg.PrivateKey) error {
+func (c *Conn) SetPrivateKey(privateKey wgkey.Private) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -2661,7 +2665,7 @@ func simpleDur(d time.Duration) time.Duration {
 }
 
 func peerShort(k key.Public) string {
-	k2 := wgcfg.Key(k)
+	k2 := wgkey.Key(k)
 	return k2.ShortString()
 }
 
@@ -2720,16 +2724,15 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 
 	if c.netMap != nil {
 		for _, addr := range c.netMap.Addresses {
-			ip := netaddr.IPFrom16(addr.IP.Addr)
-			if addr.Mask != ip.BitLen() {
+			if !addr.IsSingleIP() {
 				continue
 			}
-			sb.AddTailscaleIP(ip)
+			sb.AddTailscaleIP(addr.IP)
 			// TailAddr only allows for a single Tailscale IP. For
 			// readability of `tailscale status`, make it the IPv4
 			// address.
 			if addr.IP.Is4() {
-				ss.TailAddr = ip.String()
+				ss.TailAddr = addr.IP.String()
 			}
 		}
 	}
