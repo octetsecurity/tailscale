@@ -1,10 +1,17 @@
 package controlserver
 
 import (
+	"crypto/ed25519"
+	crand "crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"github.com/google/uuid"
 	"github.com/tailscale/wireguard-go/wgcfg"
 	"io"
+	"log"
+	"math/big"
 	"net/http"
 	"reflect"
 	"regexp"
@@ -36,8 +43,29 @@ type ControlServer struct {
 	knownHost  map[tailcfg.MachineKey]tailcfg.NodeID
 }
 
-var matchLoginRequest = regexp.MustCompile(`machine/`)
-var matchPollMapRequest = regexp.MustCompile(`machine/.*/map`)
+var matchLoginRequest = regexp.MustCompile(`machine\/\w*`)
+var matchPollMapRequest = regexp.MustCompile(`machine\/.*/map`)
+
+func (s *ControlServer) initMetacert() {
+	pub, priv, err := ed25519.GenerateKey(crand.Reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: fmt.Sprintf("derpkey%x", s.publicKey[:]),
+		},
+		// Windows requires NotAfter and NotBefore set:
+		NotAfter:  time.Now().Add(30 * 24 * time.Hour),
+		NotBefore: time.Now().Add(-30 * 24 * time.Hour),
+	}
+	cert, err := x509.CreateCertificate(crand.Reader, tmpl, tmpl, pub, priv)
+	if err != nil {
+		log.Fatalf("CreateCertificate: %v", err)
+	}
+	s.metaCert = cert
+}
 
 func NewServer(privateKey key.Private, logf logger.Logf) *ControlServer {
 	var ms runtime.MemStats
@@ -51,6 +79,8 @@ func NewServer(privateKey key.Private, logf logger.Logf) *ControlServer {
 		users:      map[tailcfg.UserID]*tailcfg.User{},
 		hosts:      map[tailcfg.NodeID]*Host{},
 	}
+
+	s.initMetacert()
 
 	return s
 }
@@ -66,10 +96,10 @@ func decode(req *http.Request, v interface{}, clientKey *wgcfg.Key, mkey *key.Pr
 func Router(s *ControlServer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case matchLoginRequest.MatchString(r.URL.Path):
-			s.loginHandler(w, r)
 		case matchPollMapRequest.MatchString(r.URL.Path):
 			s.pollNetMapHandler(w, r)
+		case matchLoginRequest.MatchString(r.URL.Path):
+			s.loginHandler(w, r)
 		default:
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(200)
@@ -77,7 +107,7 @@ func Router(s *ControlServer) http.Handler {
 				<h1>ControlServer</h1>
 				<p>
 				  This is a
-				  <a href="https://tailscale.com/">Tailscale</a>
+				  <a href="https://octetsecurity.com/">Octet</a>
 				  <a>ControlServer</a>
 				  server.
 				</p>`)
@@ -100,7 +130,7 @@ func (s *ControlServer) loginHandler(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "Method not allowed")
 		return
 	}
-	reg := regexp.MustCompile(`machine/(.*)`)
+	reg := regexp.MustCompile(`machine\/(.*)`)
 	clientMachineKey, err := matchClientMachineKey(reg, r.URL.Path)
 	if err != nil {
 		panic("Parse ClientKey Failure.")

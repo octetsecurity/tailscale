@@ -1,4 +1,4 @@
-package controller
+package main
 
 import (
 	"context"
@@ -23,10 +23,10 @@ import (
 
 var (
 	dev           = flag.Bool("dev", false, "run in localhost development mode")
-	addr          = flag.String("a", ":443", "server address")
-	configPath    = flag.String("c", "", "config file path")
-	hostname      = flag.String("hostname", "controlserver.octet.com", "LetsEncrypt host name, if addr's port is :443")
-	certDir       = flag.String("certdir", tsweb.DefaultCertDir("derper-certs"), "directory to store LetsEncrypt certs, if addr's port is :443")
+	addr          = flag.String("a", ":80", "server address")
+	configPath    = flag.String("c", "~/key.pem", "config file path")
+	hostname      = flag.String("hostname", "localhost", "LetsEncrypt host name, if addr's port is :443")
+	certDir       = flag.String("certdir", tsweb.DefaultCertDir("controlserver-certs"), "directory to store LetsEncrypt certs, if addr's port is :443")
 )
 
 type config struct {
