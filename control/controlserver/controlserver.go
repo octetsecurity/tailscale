@@ -5,22 +5,22 @@ import (
 	crand "crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"errors"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 	"github.com/tailscale/wireguard-go/wgcfg"
 	"io"
 	"log"
 	"math/big"
 	"net/http"
 	"reflect"
-	"regexp"
 	"runtime"
 	"strconv"
 	"tailscale.com/derp/derpmap"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/wgkey"
 	"time"
 )
 
@@ -35,6 +35,7 @@ type Host struct {
 type ControlServer struct {
 	privateKey key.Private
 	publicKey  key.Public
+	serverKey  *wgkey.Key
 	logf       logger.Logf
 	metaCert   []byte // the encoded x509 cert to send after LetsEncrypt cert+intermediate
 	groups     map[tailcfg.GroupID]*tailcfg.Group
@@ -42,9 +43,6 @@ type ControlServer struct {
 	hosts      map[tailcfg.NodeID]*Host
 	knownHost  map[tailcfg.MachineKey]tailcfg.NodeID
 }
-
-var matchLoginRequest = regexp.MustCompile(`machine\/\w*`)
-var matchPollMapRequest = regexp.MustCompile(`machine\/.*/map`)
 
 func (s *ControlServer) initMetacert() {
 	pub, priv, err := ed25519.GenerateKey(crand.Reader)
@@ -71,9 +69,16 @@ func NewServer(privateKey key.Private, logf logger.Logf) *ControlServer {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
+	serverKey, err := wgkey.NewPreshared()
+	if err != nil {
+		fmt.Println("fail to create controlserver")
+		return nil
+	}
+
 	s := &ControlServer{
 		privateKey: privateKey,
 		publicKey:  privateKey.Public(),
+		serverKey:  serverKey,
 		logf:       logf,
 		groups:     map[tailcfg.GroupID]*tailcfg.Group{},
 		users:      map[tailcfg.UserID]*tailcfg.User{},
@@ -93,48 +98,27 @@ func decode(req *http.Request, v interface{}, clientKey *wgcfg.Key, mkey *key.Pr
 	return nil
 }
 
-func Router(s *ControlServer) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case matchPollMapRequest.MatchString(r.URL.Path):
-			s.pollNetMapHandler(w, r)
-		case matchLoginRequest.MatchString(r.URL.Path):
-			s.loginHandler(w, r)
-		default:
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(200)
-			io.WriteString(w, `<html><body>
-				<h1>ControlServer</h1>
-				<p>
-				  This is a
-				  <a href="https://octetsecurity.com/">Octet</a>
-				  <a>ControlServer</a>
-				  server.
-				</p>`)
-		}
-	})
-}
-
-func matchClientMachineKey(reg *regexp.Regexp, url string) (wgcfg.Key, error) {
-	var err error
-	match := reg.FindStringSubmatch(url)
-	if len(match) <= 1 {
-		err = errors.New("No clientKey found.")
+func (s *ControlServer) ServerKeyPublisher(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		io.WriteString(w, "Method not allowed")
+		return
 	}
-	clientKey, err := wgcfg.ParseHexKey(match[1])
-	return clientKey, err
+	serverKeyByte := []byte(s.serverKey.HexString())
+	w.Write(serverKeyByte)
 }
 
-func (s *ControlServer) loginHandler(w http.ResponseWriter, r *http.Request) {
+func (s *ControlServer) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		io.WriteString(w, "Method not allowed")
 		return
 	}
-	reg := regexp.MustCompile(`machine\/(.*)`)
-	clientMachineKey, err := matchClientMachineKey(reg, r.URL.Path)
+	vars := mux.Vars(r)
+	clientMachineKey, err := wgcfg.ParseHexKey(vars["clientMachineKey"])
 	if err != nil {
-		panic("Parse ClientKey Failure.")
+		io.WriteString(w, "client machine key invalid")
+		return
 	}
+
 	request := tailcfg.RegisterRequest{}
 	if err := decode(r, &request, &clientMachineKey, &s.privateKey); err != nil {
 		panic("Decode login request failure")
@@ -205,15 +189,16 @@ func (s *ControlServer) broadcastHostChanged(changedNodeId tailcfg.NodeID) {
 	}
 }
 
-func (s *ControlServer) pollNetMapHandler(w http.ResponseWriter, r *http.Request) {
+func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		io.WriteString(w, "Method not allowed")
 		return
 	}
-	reg := regexp.MustCompile(`machine/(.*)/map`)
-	clientMachineKey, err := matchClientMachineKey(reg, r.URL.Path)
+	vars := mux.Vars(r)
+	clientMachineKey, err := wgcfg.ParseHexKey(vars["clientMachineKey"])
 	if err != nil {
-		panic("Parse ClientKey Failure.")
+		io.WriteString(w, "client machine key invalid")
+		return
 	}
 
 	pollRequest := tailcfg.MapRequest{}

@@ -159,7 +159,7 @@ func (p *Prefs) pretty(goos string) string {
 	if goos == "linux" {
 		fmt.Fprintf(&sb, "nf=%v ", p.NetfilterMode)
 	}
-	if p.ControlURL != "" && p.ControlURL != "https://login.tailscale.com" {
+	if p.ControlURL != "" && p.ControlURL != "http://localhost" {
 		fmt.Fprintf(&sb, "url=%q ", p.ControlURL)
 	}
 	if p.Persist != nil {
@@ -235,7 +235,7 @@ func NewPrefs() *Prefs {
 		// Provide default values for options which might be missing
 		// from the json data for any reason. The json can still
 		// override them to false.
-		ControlURL:       "https://login.tailscale.com",
+		ControlURL:       "http://localhost",
 		RouteAll:         true,
 		AllowSingleHosts: true,
 		CorpDNS:          true,

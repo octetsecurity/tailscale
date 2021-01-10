@@ -16,6 +16,7 @@ require (
 	github.com/google/go-cmp v0.5.4
 	github.com/google/uuid v1.1.4
 	github.com/goreleaser/nfpm v1.1.10
+	github.com/gorilla/mux v1.8.0
 	github.com/jsimonetti/rtnetlink v0.0.0-20201216134343-bde56ed16391
 	github.com/klauspost/compress v1.10.10
 	github.com/kr/pty v1.1.1

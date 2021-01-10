@@ -19,6 +19,7 @@ import (
 	"tailscale.com/control/controlserver"
 	"tailscale.com/tsweb"
 	"tailscale.com/types/key"
+	"github.com/gorilla/mux"
 )
 
 var (
@@ -124,13 +125,16 @@ func main() {
 	letsEncrypt := tsweb.IsProd443(*addr)
 	s := controlserver.NewServer(key.Private(cfg.PrivateKey), log.Printf)
 
-	mux := tsweb.NewMux(debugHandler(s))
-
-	mux.Handle("/", controlserver.Router(s))
+	//mux := tsweb.NewMux(debugHandler(s))
+	//mux.Handle("/", controlserver.Router(s))
+	r := mux.NewRouter()
+	r.HandleFunc("/key", s.ServerKeyPublisher).Methods("GET")
+	r.HandleFunc("/machine/{clientMachineKey}", s.LoginHandler).Methods("POST")
+	r.HandleFunc("/machine/{clientMachineKey}/map", s.PollNetMapHandler).Methods("POST")
 
 	httpsrv := &http.Server{
 		Addr: *addr,
-		Handler: mux,
+		Handler: r,
 	}
 
 	var err error
@@ -159,7 +163,7 @@ func main() {
 			return cert, nil
 		}
 		go func() {
-			err := http.ListenAndServe(":80", certManager.HTTPHandler(tsweb.Port80Handler{Main: mux}))
+			err := http.ListenAndServe(":80", certManager.HTTPHandler(tsweb.Port80Handler{Main: r}))
 			if err != nil {
 				if err != http.ErrServerClosed {
 					log.Fatal(err)
