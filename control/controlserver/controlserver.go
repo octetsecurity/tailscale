@@ -1,15 +1,21 @@
 package controlserver
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
 	crand "crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/tailscale/wireguard-go/wgcfg"
+	"golang.org/x/crypto/nacl/box"
 	"io"
+	"io/ioutil"
 	"log"
 	"math/big"
 	"net/http"
@@ -17,6 +23,7 @@ import (
 	"runtime"
 	"strconv"
 	"tailscale.com/derp/derpmap"
+	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -32,16 +39,22 @@ type Host struct {
 	PeersRemoved []tailcfg.NodeID
 }
 
+type Compressor interface {
+	EncodeAll(src, dst []byte) []byte
+	Close() error
+}
+
 type ControlServer struct {
-	privateKey key.Private
-	publicKey  key.Public
-	serverKey  *wgkey.Key
-	logf       logger.Logf
-	metaCert   []byte // the encoded x509 cert to send after LetsEncrypt cert+intermediate
-	groups     map[tailcfg.GroupID]*tailcfg.Group
-	users      map[tailcfg.UserID]*tailcfg.User
-	hosts      map[tailcfg.NodeID]*Host
-	knownHost  map[tailcfg.MachineKey]tailcfg.NodeID
+	privateKey       key.Private
+	publicKey        key.Public
+	serverPrivateKey wgkey.Private
+	logf             logger.Logf
+	newCompressor    func() (Compressor, error)
+	metaCert         []byte // the encoded x509 cert to send after LetsEncrypt cert+intermediate
+	groups           map[tailcfg.GroupID]*tailcfg.Group
+	users            map[tailcfg.UserID]*tailcfg.User
+	hosts            map[tailcfg.NodeID]*Host
+	knownHost        map[tailcfg.MachineKey]tailcfg.NodeID
 }
 
 func (s *ControlServer) initMetacert() {
@@ -69,33 +82,118 @@ func NewServer(privateKey key.Private, logf logger.Logf) *ControlServer {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
-	serverKey, err := wgkey.NewPreshared()
+	serverKey, err := wgkey.NewPrivate()
 	if err != nil {
 		fmt.Println("fail to create controlserver")
 		return nil
 	}
 
 	s := &ControlServer{
-		privateKey: privateKey,
-		publicKey:  privateKey.Public(),
-		serverKey:  serverKey,
-		logf:       logf,
-		groups:     map[tailcfg.GroupID]*tailcfg.Group{},
-		users:      map[tailcfg.UserID]*tailcfg.User{},
-		hosts:      map[tailcfg.NodeID]*Host{},
+		privateKey:       privateKey,
+		publicKey:        privateKey.Public(),
+		serverPrivateKey: serverKey,
+		logf:             logf,
+		groups:           map[tailcfg.GroupID]*tailcfg.Group{},
+		users:            map[tailcfg.UserID]*tailcfg.User{},
+		hosts:            map[tailcfg.NodeID]*Host{},
+		knownHost:        map[tailcfg.MachineKey]tailcfg.NodeID{},
 	}
+	s.SetNewCompressor(func() (Compressor, error) {
+		return smallzstd.NewEncoder(nil)
+	})
 
 	s.initMetacert()
 
 	return s
 }
 
-func encode(v interface{}, clientKey *wgcfg.Key, mkey *key.Private) ([]byte, error) {
-	return nil, nil
+func (s *ControlServer) SetNewCompressor(fn func() (Compressor, error)) {
+	s.newCompressor = fn
 }
 
-func decode(req *http.Request, v interface{}, clientKey *wgcfg.Key, mkey *key.Private) error {
+func encode(v interface{}, clientKey *wgcfg.Key, mkey *wgkey.Private) ([]byte, error) {
+	// Server encoding a response it sends to a client
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	var nonce [24]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		panic(err)
+	}
+	pub, pri := (*[32]byte)(clientKey), (*[32]byte)(mkey)
+	msg := box.Seal(nonce[:], b, &nonce, pub, pri)
+	return msg, nil
+}
+
+func (s *ControlServer) encodeAndCompress(v interface{}, clientKey *wgcfg.Key, mkey *wgkey.Private) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	encoder, err := s.newCompressor()
+	if err != nil {
+		return nil, err
+	}
+	defer encoder.Close()
+	out := []byte{}
+	out = encoder.EncodeAll(b, out)
+
+	var nonce [24]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		panic(err)
+	}
+	pub, pri := (*[32]byte)(clientKey), (*[32]byte)(mkey)
+	msg := box.Seal(nonce[:], out, &nonce, pub, pri)
+	return msg, nil
+}
+
+func decode(req *http.Request, v interface{}, clientKey *wgcfg.Key, mkey *wgkey.Private) error {
+	// Server decoding a request it receives from a client
+	// req is the http.Request received by the server
+	defer req.Body.Close()
+	msg, err := ioutil.ReadAll(io.LimitReader(req.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	// Call decodeMsg to set v
+	return decodeMsg(msg, v, clientKey, mkey)
+}
+
+var jsonEscapedZero = []byte(`\u0000`)
+
+func decodeMsg(msg []byte, v interface{}, clientKey *wgcfg.Key, mkey *wgkey.Private) error {
+	// Call decryptMsg to obtain decrypted, which will be used to unmarshal into v
+	decrypted, err := decryptMsg(msg, clientKey, mkey)
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(decrypted, jsonEscapedZero) {
+		log.Printf("[unexpected] zero byte in controlclient decodeMsg into %T: %q", v, decrypted)
+	}
+	// Unmarshal decrypted into v, thereby achieving our goal
+	if err := json.Unmarshal(decrypted, v); err != nil {
+		return fmt.Errorf("response: %v", err)
+	}
 	return nil
+}
+
+func decryptMsg(msg []byte, clientKey *wgcfg.Key, mkey *wgkey.Private) ([]byte, error) {
+	var nonce [24]byte
+	if len(msg) < len(nonce)+1 {
+		return nil, fmt.Errorf("request missing nonce, len=%d", len(msg))
+	}
+	copy(nonce[:], msg)
+	msg = msg[len(nonce):]
+
+	pub, pri := (*[32]byte)(clientKey), (*[32]byte)(mkey)
+	decrypted, ok := box.Open(nil, msg, &nonce, pub, pri)
+	if !ok {
+		return nil, fmt.Errorf("cannot decrypt request (len %d + nonce %d = %d)", len(msg), len(nonce), len(msg)+len(nonce))
+	}
+	return decrypted, nil
 }
 
 func (s *ControlServer) ServerKeyPublisher(w http.ResponseWriter, r *http.Request) {
@@ -103,8 +201,8 @@ func (s *ControlServer) ServerKeyPublisher(w http.ResponseWriter, r *http.Reques
 		io.WriteString(w, "Method not allowed")
 		return
 	}
-	serverKeyByte := []byte(s.serverKey.HexString())
-	w.Write(serverKeyByte)
+	fmt.Println("ServerKey is ", s.serverPrivateKey.Public().String())
+	fmt.Fprintf(w, s.serverPrivateKey.Public().HexString())
 }
 
 func (s *ControlServer) LoginHandler(w http.ResponseWriter, r *http.Request) {
@@ -114,27 +212,37 @@ func (s *ControlServer) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	vars := mux.Vars(r)
 	clientMachineKey, err := wgcfg.ParseHexKey(vars["clientMachineKey"])
+	fmt.Println("Client machine key is ", clientMachineKey.String())
 	if err != nil {
 		io.WriteString(w, "client machine key invalid")
 		return
 	}
 
 	request := tailcfg.RegisterRequest{}
-	if err := decode(r, &request, &clientMachineKey, &s.privateKey); err != nil {
+	if err := decode(r, &request, &clientMachineKey, &s.serverPrivateKey); err != nil {
 		panic("Decode login request failure")
 	}
 
 	// TODO: implement login logic
 
+	login := tailcfg.Login{
+		ID:            1,
+		Provider:      "provider",
+		LoginName:     "OctetTest",
+		DisplayName:   "OctetTest",
+		ProfilePicURL: "",
+		Domain:        "Octet",
+	}
+
 	res := tailcfg.RegisterResponse{
 		User:              tailcfg.User{},
-		Login:             tailcfg.Login{},
+		Login:             login,
 		NodeKeyExpired:    false,
 		MachineAuthorized: false,
 		AuthURL:           "",
 	}
 
-	resBody, err := encode(res, &clientMachineKey, &s.privateKey)
+	resBody, err := encode(res, &clientMachineKey, &s.serverPrivateKey)
 	if err != nil {
 		panic("Encode login response failure.")
 	}
@@ -149,13 +257,16 @@ func idGenerator() int64 {
 
 func (s *ControlServer) broadcastNewHost(newHostNodeId tailcfg.NodeID) {
 	for _, nodeId := range s.knownHost {
-		s.hosts[nodeId].Peers = append(s.hosts[nodeId].Peers, newHostNodeId)
+		if nodeId != newHostNodeId {
+			s.hosts[nodeId].Peers = append(s.hosts[nodeId].Peers, newHostNodeId)
+		}
+
 	}
 }
 
 func (s *ControlServer) addNewHost(node *tailcfg.Node, derpMap *tailcfg.DERPMap,
-	knownHost map[tailcfg.MachineKey]tailcfg.NodeID, machineKey tailcfg.MachineKey) Host {
-	knownHostCopy := knownHost
+	machineKey tailcfg.MachineKey) Host {
+	knownHostCopy := s.knownHost
 	delete(knownHostCopy, node.Machine)
 
 	knownNodeId := make([]tailcfg.NodeID, 0, len(knownHostCopy))
@@ -189,6 +300,44 @@ func (s *ControlServer) broadcastHostChanged(changedNodeId tailcfg.NodeID) {
 	}
 }
 
+//func waitForChange(ctx context.Context, notifyChan chan int) tailcfg.MapResponse {
+//	waiter := time.Tick(10 * time.Second)
+//	log.Printf("will wait up to 10s for the resource")
+//
+//	select {
+//	case <-ctx.Done():
+//		log.Printf("Received context cancel")
+//		return tailcfg.MapResponse{}
+//	case ts := <-waiter:
+//		log.Printf("Received method timeout: %s", ts)
+//		return tailcfg.MapResponse{}
+//	case _ = <-notifyChan:
+//		log.Printf("Received resource update")
+//		return
+//	}
+//}
+
+//func resourceUpdateHandler() tailcfg.MapResponse {
+//	resp := tailcfg.MapResponse{
+//		// TODO: implement keepAlive logic when response is too long
+//		KeepAlive:    false,
+//		Node:         nil,
+//		DERPMap:      nil,
+//		Peers:        nil,
+//		PeersChanged: nil,
+//		PeersRemoved: nil,
+//		DNS:          nil,
+//		SearchPaths:  nil,
+//		DNSConfig:    tailcfg.DNSConfig{},
+//		Domain:       "",
+//		PacketFilter: nil,
+//		UserProfiles: nil,
+//		Roles:        nil,
+//		Debug:        nil,
+//	}
+//
+//}
+
 func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		io.WriteString(w, "Method not allowed")
@@ -202,13 +351,13 @@ func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	pollRequest := tailcfg.MapRequest{}
-	if err := decode(r, &pollRequest, &clientMachineKey, &s.privateKey); err != nil {
+	if err := decode(r, &pollRequest, &clientMachineKey, &s.serverPrivateKey); err != nil {
 		panic("Decode pollNetMap request failure")
 	}
 
-	// TODO: implement real logic
 	resp := tailcfg.MapResponse{
-		KeepAlive:    pollRequest.KeepAlive,
+		// TODO: implement keepAlive logic when response is too long
+		KeepAlive:    false,
 		Node:         nil,
 		DERPMap:      nil,
 		Peers:        nil,
@@ -246,8 +395,9 @@ func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request
 
 		if !pollRequest.Hostinfo.Equal(&host.Node.Hostinfo) {
 			// update node info
+			fmt.Println("New hostInfo is ", pollRequest.Hostinfo)
 			host.Node.AllowedIPs = pollRequest.Hostinfo.RoutableIPs
-			host.Node.DERP = strconv.Itoa(pollRequest.Hostinfo.NetInfo.PreferredDERP)
+			host.Node.DERP = derpmap.Prod().Regions[pollRequest.Hostinfo.NetInfo.PreferredDERP].Nodes[0].IPv4
 			host.Node.Hostinfo = *pollRequest.Hostinfo
 			hostChanged = true
 		}
@@ -282,16 +432,19 @@ func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request
 			Addresses:         pollRequest.Hostinfo.RoutableIPs, // TODO: need to put wireguard IP here, I guess it's the first item in allowedIps
 			AllowedIPs:        pollRequest.Hostinfo.RoutableIPs,
 			Endpoints:         pollRequest.Endpoints,
-			DERP:              strconv.Itoa(pollRequest.Hostinfo.NetInfo.PreferredDERP),
+			DERP:              "",
 			Hostinfo:          *pollRequest.Hostinfo,
 			Created:           time.Now(),
 			LastSeen:          nil,
 			KeepAlive:         pollRequest.KeepAlive,
 			MachineAuthorized: true,
 		}
+		if pollRequest.Hostinfo.NetInfo != nil && pollRequest.Hostinfo.NetInfo.PreferredDERP != 0 {
+			node.DERP = strconv.Itoa(pollRequest.Hostinfo.NetInfo.PreferredDERP)
+		}
 		resp.Node = &node
 		resp.DERPMap = derpmap.Prod()
-		host := s.addNewHost(&node, derpmap.Prod(), s.knownHost, tailcfg.MachineKey(clientMachineKey))
+		host := s.addNewHost(&node, derpmap.Prod(), tailcfg.MachineKey(clientMachineKey))
 		peers := []*tailcfg.Node{}
 		for _, nodeId := range host.Peers {
 			peers = append(peers, s.hosts[nodeId].Node)
@@ -299,11 +452,20 @@ func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request
 		resp.Peers = peers
 	}
 
-	resBody, err := encode(resp, &clientMachineKey, &s.privateKey)
+	resBody := []byte{}
+	if pollRequest.Compress == "zstd" {
+		resBody, err = s.encodeAndCompress(resp, &clientMachineKey, &s.serverPrivateKey)
+	} else {
+		resBody, err = encode(resp, &clientMachineKey, &s.serverPrivateKey)
+	}
+
 	if err != nil {
 		panic("Encode login response failure.")
 	}
 
+	var size [4]byte
+	binary.LittleEndian.PutUint32(size[:], uint32(len(resBody)))
+	w.Write(size[:])
 	w.Write(resBody)
 }
 

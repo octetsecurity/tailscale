@@ -20,6 +20,7 @@ import (
 	"tailscale.com/tsweb"
 	"tailscale.com/types/key"
 	"github.com/gorilla/mux"
+	"time"
 )
 
 var (
@@ -135,6 +136,8 @@ func main() {
 	httpsrv := &http.Server{
 		Addr: *addr,
 		Handler: r,
+		ReadTimeout: 10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
 	var err error
