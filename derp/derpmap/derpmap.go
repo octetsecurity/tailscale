@@ -86,3 +86,13 @@ func Prod() *tailcfg.DERPMap {
 		},
 	}
 }
+
+func Test() *tailcfg.DERPMap {
+	return &tailcfg.DERPMap{
+		Regions: map[int]*tailcfg.DERPRegion{
+			1: derpRegion(1, "test", "test",
+				derpNode("a", "159.65.73.98", ""),
+			),
+		},
+	}
+}

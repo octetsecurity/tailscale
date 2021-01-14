@@ -17,12 +17,14 @@ require (
 	github.com/google/uuid v1.1.4
 	github.com/goreleaser/nfpm v1.1.10
 	github.com/gorilla/mux v1.8.0
+	github.com/jcuga/golongpoll v1.1.0
 	github.com/jsimonetti/rtnetlink v0.0.0-20201216134343-bde56ed16391
 	github.com/klauspost/compress v1.10.10
 	github.com/kr/pty v1.1.1
 	github.com/mdlayher/netlink v1.2.0
 	github.com/mdlayher/sdnotify v0.0.0-20200625151349-e4a4f32afc4a
 	github.com/miekg/dns v1.1.30
+	github.com/nu7hatch/gouuid v0.0.0-20131221200532-179d4d0c4d8d // indirect
 	github.com/pborman/getopt v0.0.0-20190409184431-ee0cd42419d3
 	github.com/peterbourgon/ff/v2 v2.0.0
 	github.com/tailscale/depaware v0.0.0-20201214215404-77d1e9757027
