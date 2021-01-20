@@ -452,7 +452,7 @@ func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request
 			Hostinfo:          *pollRequest.Hostinfo,
 			Created:           time.Now(),
 			LastSeen:          nil,
-			KeepAlive:         pollRequest.KeepAlive,
+			KeepAlive:         false,
 			MachineAuthorized: true,
 		}
 		if pollRequest.Hostinfo.NetInfo != nil && pollRequest.Hostinfo.NetInfo.PreferredDERP != 0 {
