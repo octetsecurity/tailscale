@@ -369,6 +369,19 @@ func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request
 		panic("Decode pollNetMap request failure")
 	}
 
+	filterRule := tailcfg.FilterRule{
+		SrcIPs:   []string{"*"},
+		SrcBits:  nil,
+		DstPorts: []tailcfg.NetPortRange{tailcfg.NetPortRange{
+				IP:    "*",
+				Ports: tailcfg.PortRange{
+					First: 0,
+					Last:  65535,
+				},
+			},
+		},
+	}
+
 	resp := tailcfg.MapResponse{
 		// TODO: implement keepAlive logic when response is too long
 		KeepAlive:    false,
@@ -381,7 +394,7 @@ func (s *ControlServer) PollNetMapHandler(w http.ResponseWriter, r *http.Request
 		SearchPaths:  nil,
 		DNSConfig:    tailcfg.DNSConfig{},
 		Domain:       "",
-		PacketFilter: nil,
+		PacketFilter: []tailcfg.FilterRule{filterRule},
 		UserProfiles: nil,
 		Roles:        nil,
 		Debug:        nil,
