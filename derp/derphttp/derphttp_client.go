@@ -293,14 +293,12 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 
 	brw := bufio.NewReadWriter(bufio.NewReader(httpConn), bufio.NewWriter(httpConn))
 	var derpClient *derp.Client
-
 	req, err := http.NewRequest("GET", c.urlString(node), nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	req.Header.Set("Upgrade", "DERP")
 	req.Header.Set("Connection", "Upgrade")
-
 	if !serverPub.IsZero() && serverProtoVersion != 0 {
 		// parseMetaCert found the server's public key (no TLS
 		// middlebox was in the way), so skip the HTTP upgrade
@@ -316,20 +314,22 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		// No need to flush the HTTP request. the derp.Client's initial
 		// client auth frame will flush it.
 	} else {
+		// Patrick: got into here
 		if err := req.Write(brw); err != nil {
 			return nil, 0, err
 		}
 		if err := brw.Flush(); err != nil {
 			return nil, 0, err
 		}
-
 		resp, err := http.ReadResponse(brw.Reader, req)
 		if err != nil {
 			return nil, 0, err
 		}
+		log.Printf("Response status code is: %d\n", resp.StatusCode)
 		if resp.StatusCode != http.StatusSwitchingProtocols {
 			b, _ := ioutil.ReadAll(resp.Body)
 			resp.Body.Close()
+			log.Println("GOT HERE")
 			return nil, 0, fmt.Errorf("GET failed: %v: %s", err, b)
 		}
 	}

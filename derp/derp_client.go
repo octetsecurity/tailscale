@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -364,7 +365,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 
 		// If the frame fits in our bufio.Reader buffer, just use it.
 		// In practice it's 4KB (from derphttp.Client's bufio.NewReader(httpConn)) and
-		// in practive, WireGuard packets (and thus DERP frames) are under 1.5KB.
+		// in practice, WireGuard packets (and thus DERP frames) are under 1.5KB.
 		// So this is the common path.
 		if int(n) <= c.br.Size() {
 			b, err = c.br.Peek(int(n))
@@ -380,6 +381,8 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			return nil, err
 		}
 
+		log.Printf("Frame type is: %b\n", t)
+
 		switch t {
 		default:
 			continue
@@ -390,6 +393,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			// needing to wait an RTT to discover the version at startup.
 			// We'd prefer to give the connection to the client (magicsock)
 			// to start writing as soon as possible.
+			log.Println("Entered frameServerInfo")
 			_, err := c.parseServerInfo(b)
 			if err != nil {
 				return nil, fmt.Errorf("invalid server info frame: %v", err)
@@ -397,10 +401,12 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			// TODO: add the results of parseServerInfo to ServerInfoMessage if we ever need it.
 			return ServerInfoMessage{}, nil
 		case frameKeepAlive:
+			log.Println("Entered frameKeepAlive\n")
 			// TODO: eventually we'll have server->client pings that
 			// require ack pongs.
 			continue
 		case framePeerGone:
+			log.Println("Entered framePeerGone\n")
 			if n < keyLen {
 				c.logf("[unexpected] dropping short peerGone frame from DERP server")
 				continue
@@ -410,6 +416,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			return pg, nil
 
 		case framePeerPresent:
+			log.Println("Entered framePeerPresent\n")
 			if n < keyLen {
 				c.logf("[unexpected] dropping short peerPresent frame from DERP server")
 				continue
@@ -419,6 +426,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			return pg, nil
 
 		case frameRecvPacket:
+			log.Println("Entered frameRecvPacket\n")
 			var rp ReceivedPacket
 			if n < keyLen {
 				c.logf("[unexpected] dropping short packet from DERP server")

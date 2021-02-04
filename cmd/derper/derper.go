@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tailscale/wireguard-go/wgcfg"
 	"golang.org/x/crypto/acme/autocert"
 	"tailscale.com/atomicfile"
 	"tailscale.com/derp"
@@ -34,13 +35,13 @@ import (
 	"tailscale.com/net/stun"
 	"tailscale.com/tsweb"
 	"tailscale.com/types/key"
-	"tailscale.com/types/wgkey"
 	"tailscale.com/version"
 )
 
 var (
-	dev           = flag.Bool("dev", false, "run in localhost development mode")
-	addr          = flag.String("a", ":443", "server address")
+	dev = flag.Bool("dev", false, "run in localhost development mode")
+	// addr          = flag.String("a", ":443", "server address")
+	addr          = flag.String("a", ":3340", "server address")
 	configPath    = flag.String("c", "", "config file path")
 	certDir       = flag.String("certdir", tsweb.DefaultCertDir("derper-certs"), "directory to store LetsEncrypt certs, if addr's port is :443")
 	hostname      = flag.String("hostname", "derp.tailscale.com", "LetsEncrypt host name, if addr's port is :443")
@@ -51,7 +52,7 @@ var (
 )
 
 type config struct {
-	PrivateKey wgkey.Private
+	PrivateKey wgcfg.PrivateKey
 }
 
 func loadConfig() config {
@@ -77,8 +78,8 @@ func loadConfig() config {
 	}
 }
 
-func mustNewKey() wgkey.Private {
-	key, err := wgkey.NewPrivate()
+func mustNewKey() wgcfg.PrivateKey {
+	key, err := wgcfg.NewPrivateKey()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -137,9 +138,9 @@ func main() {
 		s.SetMeshKey(key)
 		log.Printf("DERP mesh key configured")
 	}
-	if err := startMesh(s); err != nil {
-		log.Fatalf("startMesh: %v", err)
-	}
+	//  if err := startMesh(s); err != nil {
+	//   log.Fatalf("startMesh: %v", err)
+	//  }
 	expvar.Publish("derp", s.ExpVar())
 
 	// Create our own mux so we don't expose /debug/ stuff to the world.
